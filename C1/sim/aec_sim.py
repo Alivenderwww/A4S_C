@@ -202,6 +202,16 @@ class Sim:
         def a_f32(r): return R[:, r].view(np.float32)
         def a_f16(r): return (R[:, r] & 0xffff).astype(np.uint16).view(np.float16)
 
+        def a_f64(r):   # 64-bit double lives in the register pair {R[r+1], R[r]}.
+            return (R[:, r].astype(np.uint64) |
+                    (R[:, (r + 1) & 0xff].astype(np.uint64) << 32)).view(np.float64)
+
+        def wr_f64(reg, val):
+            bits = val.astype(np.float64).view(np.uint64)
+            R[:, reg] = np.where(em, (bits & 0xffffffff).astype(np.uint32), R[:, reg])
+            hi = (reg + 1) & 0xff
+            R[:, hi] = np.where(em, (bits >> np.uint64(32)).astype(np.uint32), R[:, hi])
+
         is_f = ty in ("f32", "f16", "bf16", "f64")
 
         if op == "LOADI":
@@ -213,6 +223,18 @@ class Sim:
             wr_u32(d, R[:, s1])  # register copy (any 32-bit type)
             return
         if op in ("ADD", "SUB", "MUL", "MAD", "MIN", "MAX", "NEG", "ABS"):
+            if ty == "f64":                       # 64-bit double (register pair).
+                x = a_f64(s1)
+                y = a_f64(s2) if op not in ("NEG", "ABS") else None
+                if op == "ADD": r = x + y
+                elif op == "SUB": r = x - y
+                elif op == "MUL": r = x * y
+                elif op == "MIN": r = np.minimum(x, y)
+                elif op == "MAX": r = np.maximum(x, y)
+                elif op == "NEG": r = -x
+                elif op == "ABS": r = np.abs(x)
+                elif op == "MAD": r = x * y + a_f64(s3)
+                wr_f64(d, r); return
             if is_f:
                 x = a_f32(s1) if ty in ("f32",) else a_f32(s1)  # f16/bf16 promoted below
                 if ty == "f16":
@@ -327,7 +349,11 @@ class Sim:
         if op == "ST":
             addr = R[:, s1]
             mem = {0: self.gmem, 1: smem, 3: lmem}.get(ins.space, self.gmem)
-            self._store(mem, addr, 4, R[:, s2], em); return
+            self._store(mem, addr, 4, R[:, s2], em)
+            if ty in ("b64", "f64"):              # store the high word too.
+                self._store(mem, (addr.astype(np.int64) + 4).astype(np.uint32), 4,
+                            R[:, (s2 + 1) & 0xff], em)
+            return
         # anything else: flag (helps find missing lowering / illegal ops)
         raise ExecError("unimplemented/illegal op '%s.%s' at runtime" % (op, ty))
 

@@ -9,11 +9,14 @@ are NOT a multiple of blockDim, which exercises the divergent bounds-guard path
 The param block is packed to match aec-cc's natural, tight, declaration-order
 layout. Pointers are GMEM byte offsets into a single flat GMEM image.
 """
+import os
 import struct
 import numpy as np
 
 F32 = np.dtype("<f4")
 F16 = np.dtype("<f2")
+F64 = np.dtype("<f8")
+_EXTRA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extra_ptx")
 
 
 def _f32(x):
@@ -123,7 +126,22 @@ def gemm_f16(M=16, N=16, K=16, dtype="f16", seed=5):
                 gmem=gmem, out=(c_off, M * N, F32), ref=ref, dtype=dtype)
 
 
+def vector_add_f64(n=256, block=64, seed=6):
+    # FP64: each element is 8 bytes and lives in a REGISTER PAIR — exercises the
+    # pair-aware register allocator (esp. combined with the pressure mutation).
+    rng = np.random.default_rng(seed)
+    a = rng.standard_normal(n).astype(np.float64)
+    b = rng.standard_normal(n).astype(np.float64)
+    a_off, b_off, c_off = 0, n * 8, 2 * n * 8
+    gmem = bytearray(3 * n * 8)
+    _place(gmem, a_off, a.tobytes()); _place(gmem, b_off, b.tobytes())
+    grid = (n + block - 1) // block
+    return dict(ptx=os.path.join(_EXTRA, "f64_vadd.ptx"), grid=(grid, 1, 1),
+                block=(block, 1, 1), param=struct.pack("<QQQI", a_off, b_off, c_off, n),
+                gmem=gmem, out=(c_off, n, F64), ref=a + b)
+
+
 ALL = {
     "vadd": vector_add, "poly": invariant_poly, "reuse": repeated_reuse,
-    "reg": reg_schedule, "gemm": gemm_f16,
+    "reg": reg_schedule, "gemm": gemm_f16, "vaddf64": vector_add_f64,
 }

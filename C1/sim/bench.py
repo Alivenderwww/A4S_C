@@ -50,6 +50,8 @@ SWEEP = {
              dict(n=999, block=256)],
     "gemm": [dict(M=16, N=16, K=16), dict(M=32, N=32, K=32), dict(M=64, N=48, K=32),
              dict(M=17, N=16, K=16), dict(M=16, N=16, K=24), dict(M=48, N=33, K=16)],
+    # FP64 -> register-pair values; the pressure mutation stresses pair alloc.
+    "vaddf64": [dict(n=256, block=64), dict(n=512, block=128), dict(n=1024, block=256)],
 }
 
 tally = {"PASS": 0, "FAIL": 0, "DIVERGE": 0, "SIM-ERR": 0, "COMPILE-ERR": 0}
@@ -91,7 +93,7 @@ def record(kind, detail, label):
 
 def run_variant(src_text, case, opt, tag, label):
     path = os.path.join(BUILD, tag + ".ptx")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(src_text)
     aecbin, err = compile_src(path, opt, tag)
     if aecbin is None:
@@ -101,7 +103,7 @@ def run_variant(src_text, case, opt, tag, label):
 
 
 def read_src(ptx_name):
-    with open(os.path.join(PTXDIR, ptx_name)) as f:
+    with open(os.path.join(PTXDIR, ptx_name), encoding="utf-8") as f:
         return f.read()
 
 

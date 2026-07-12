@@ -16,6 +16,7 @@
 #include "aec/target.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <vector>
@@ -133,31 +134,55 @@ void linearScan(ir::Function &fn, const Options & /*opt*/) {
     ivs.push_back(it->second);
   std::sort(ivs.begin(), ivs.end(), byStart);
 
-  // --- 5. Linear scan. Free pool R1..R(kRegisterCount-1) (R0 = scratch). ---
-  std::vector<int> freePool;
-  for (int r = (int)kRegisterCount - 1; r >= 1; --r) freePool.push_back(r);
-  std::vector<int> active; // indices into ivs, expired lazily.
+  // Wide vregs occupy a REGISTER PAIR {R, R+1} (64-bit b64/f64 values -> the
+  // hardware reads {R[d+1],R[d]}). The allocator must reserve BOTH halves, or a
+  // later value assigned R+1 clobbers the high word. narrowAddr() already
+  // collapses .b64 pointer math to 32-bit, so in practice this covers genuine
+  // 64-bit data (f64 / b64 loads).
+  std::set<uint32_t> wide;
+  for (unsigned b = 0; b < nb; ++b)
+    for (unsigned i = 0; i < fn.blocks[b].insts.size(); ++i) {
+      const ir::Inst &in = fn.blocks[b].insts[i];
+      if (in.type != ir::Type::B64 && in.type != ir::Type::F64) continue;
+      if (in.dst.kind == ir::Operand::Reg) wide.insert(in.dst.value);
+      const ir::Operand *s[3] = {&in.s1, &in.s2, &in.s3};
+      for (int k = 0; k < 3; ++k)
+        if (s[k]->kind == ir::Operand::Reg) wide.insert(s[k]->value);
+    }
+  if (std::getenv("AEC_NO_PAIR")) wide.clear();   // A/B knob: disable pair-awareness.
+
+  // --- 5. Pair-aware linear scan. R0 = scratch; R1..255 allocatable. -------
+  std::set<int> freeSet;
+  for (int r = 1; r < (int)kRegisterCount; ++r) freeSet.insert(r);
+  std::vector<int> active;               // indices into ivs, expired lazily.
   std::map<uint32_t, int> physOf;
   uint32_t spillCount = 0, maxPhys = 0;
 
   for (unsigned i = 0; i < ivs.size(); ++i) {
     std::vector<int> keep;
     for (unsigned a = 0; a < active.size(); ++a) {
-      if (ivs[active[a]].end < ivs[i].start) freePool.push_back(ivs[active[a]].phys);
-      else keep.push_back(active[a]);
+      const Interval &e = ivs[active[a]];
+      if (e.end < ivs[i].start) {
+        freeSet.insert(e.phys);
+        if (wide.count(e.vreg)) freeSet.insert(e.phys + 1);   // return both halves.
+      } else keep.push_back(active[a]);
     }
     active.swap(keep);
 
-    int reg;
-    if (!freePool.empty()) { reg = freePool.back(); freePool.pop_back(); }
-    else {
-      // SPILL STUB: real allocator would spill the furthest-end interval to an
-      // LMEM slot and emit LD/ST. TODO(T4): materialize spill code.
-      reg = (int)kRegisterCount - 1; ++spillCount;
+    int reg = -1;
+    if (wide.count(ivs[i].vreg)) {                            // needs a pair.
+      for (std::set<int>::iterator it = freeSet.begin(); it != freeSet.end(); ++it)
+        if (*it + 1 < (int)kRegisterCount && freeSet.count(*it + 1)) { reg = *it; break; }
+      if (reg >= 0) { freeSet.erase(reg); freeSet.erase(reg + 1); }
+      else { reg = (int)kRegisterCount - 2; ++spillCount; }   // pair spill stub.
+      if ((uint32_t)(reg + 1) > maxPhys) maxPhys = (uint32_t)(reg + 1);
+    } else {
+      if (!freeSet.empty()) { reg = *freeSet.begin(); freeSet.erase(reg); }
+      else { reg = (int)kRegisterCount - 1; ++spillCount; }
+      if ((uint32_t)reg > maxPhys) maxPhys = (uint32_t)reg;
     }
     ivs[i].phys = reg;
     physOf[ivs[i].vreg] = reg;
-    if ((uint32_t)reg > maxPhys) maxPhys = (uint32_t)reg;
     active.push_back((int)i);
   }
 
