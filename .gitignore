@@ -1,2 +1,10 @@
 /public
 /私钥
+
+# remote_exec 使用的 SSH 私钥（按 id 命名，绝不提交）
+/mig[0-9]*
+/mig[0-9]*.pub
+
+# Python 字节码
+__pycache__/
+*.py[cod]

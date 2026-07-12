@@ -35,3 +35,21 @@ C3 算子调度 : ONNX 模型    ──►  AEC GPGPU 推理
 1. 先读本文「子题概览」与官方 `public/Track-C/*/spec.md`、`scoring.md`——熟悉题型与评分构成。
 2. 再读 [`docs/赛道C-知识库与作战手册.md`](./docs/赛道C-知识库与作战手册.md) §1，搞清「实际给了什么 / 要自建什么」。
 3. 最后按子题精读 [`docs/Track-C-Reading-Notes.md`](./docs/Track-C-Reading-Notes.md)（§1–§3 摘要 + §6 配套背景，每节标注来源 URL 与对应子题）。
+
+## 远程执行工具 `scripts/remote_exec.py`
+
+在远程服务器（他人提供的固定账号）上执行命令（如编译、跑 grader）并取回结果。跨平台（Windows / Linux / macOS），仅依赖 Python 标准库 + 系统 `ssh`，无需 pip 安装。
+
+**固定连接**：`ssh -i ./mig02 mig02@39.107.68.147 -p 1102`
+
+**用法**：
+
+```bash
+python scripts/remote_exec.py "cd ~/A4S && make -j2 2>&1"   # 实时流式输出（看得到编译进度）
+python scripts/remote_exec.py --dry-run make                 # 只看 ssh 命令，不连接
+python scripts/remote_exec.py --json python3 grader/x.py     # 结束后 stdout 输出 JSON
+```
+
+退出码 = 远程退出码；默认模式远程 stdout/stderr 实时透传，stderr 末行 `[remote_exec] exit=N`。私钥放当前目录命名 `mig02`（找不到会自动从 `~/.ssh/mig02` 复制并 `chmod 600`；已 gitignore）。
+
+> ⚠️ 公网流量有限，**禁止上传/下载大文件**；**禁止隧道 / 端口转发**（脚本已强制 `ClearAllForwardings=yes`）。
