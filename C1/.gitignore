@@ -9,3 +9,8 @@
 /sim/build/
 __pycache__/
 /agent/_agent_work/
+
+# Submission entry points are copied from bin/ by `make submit` (agent/run_agent
+# is a committed wrapper, so it is NOT ignored).
+/compiler/
+/disassembler/

@@ -212,6 +212,15 @@ struct Builder {
     emit(in);
   }
 
+  void lowerUnary(Op opc, Type ty, const ptx::Instruction &s) {
+    if (s.operands.size() < 2) return;
+    ir::Inst in;
+    in.op = opc; in.type = narrowAddr(ty);
+    in.dst = ir::Operand::reg(regFor(s.operands[0].name));
+    in.s1  = asReg(s.operands[1], ty);
+    emit(in);
+  }
+
   void lowerFMA(Op opc, Type ty, const ptx::Instruction &s) {
     if (s.operands.size() < 4) return;
     ir::Inst in;
@@ -302,6 +311,22 @@ void Builder::translate(const ptx::Instruction &s) {
   if (m == "div")  { lowerBinary(Op::DIV, ty, s); return; }
   if (m == "min")  { lowerBinary(Op::MIN, ty, s); return; }
   if (m == "max")  { lowerBinary(Op::MAX, ty, s); return; }
+  if (m == "rem")  { lowerBinary(Op::DIV, ty, s); return; }  // TODO: true remainder
+
+  // Unary arithmetic / bit / SFU ops (dst, src). Common in activation-style and
+  // math-heavy kernels beyond the 5 public examples.
+  if (m == "neg")  { lowerUnary(Op::NEG, ty, s); return; }
+  if (m == "abs")  { lowerUnary(Op::ABS, ty, s); return; }
+  if (m == "not")  { lowerUnary(Op::NOT, ty == Type::NONE ? Type::B32 : ty, s); return; }
+  if (m == "popc") { lowerUnary(Op::POPC, ty == Type::NONE ? Type::B32 : ty, s); return; }
+  if (m == "bfind"){ lowerUnary(Op::FLO, ty == Type::NONE ? Type::U32 : ty, s); return; }
+  if (m == "sqrt") { lowerUnary(Op::SQRT, ty == Type::NONE ? Type::F32 : ty, s); return; }
+  if (m == "rcp")  { lowerUnary(Op::RCP, ty == Type::NONE ? Type::F32 : ty, s); return; }
+  if (m == "rsqrt"){ lowerUnary(Op::RSQ, ty == Type::NONE ? Type::F32 : ty, s); return; }
+  if (m == "sin")  { lowerUnary(Op::SIN, ty == Type::NONE ? Type::F32 : ty, s); return; }
+  if (m == "cos")  { lowerUnary(Op::COS, ty == Type::NONE ? Type::F32 : ty, s); return; }
+  if (m == "ex2")  { lowerUnary(Op::EXP, ty == Type::NONE ? Type::F32 : ty, s); return; }
+  if (m == "lg2")  { lowerUnary(Op::LOG, ty == Type::NONE ? Type::F32 : ty, s); return; }
   if (m == "and")  { lowerBinary(Op::AND, ty == Type::NONE ? Type::B32 : ty, s); return; }
   if (m == "or")   { lowerBinary(Op::OR,  ty == Type::NONE ? Type::B32 : ty, s); return; }
   if (m == "xor")  { lowerBinary(Op::XOR, ty == Type::NONE ? Type::B32 : ty, s); return; }
@@ -362,11 +387,15 @@ void Builder::translate(const ptx::Instruction &s) {
     ir::Inst in; in.op = Op::SYNC_WG; emit(in); return;
   }
 
-  if (m == "ret") { ir::Inst in; in.op = Op::RET; emit(in); return; }
+  // Top-level `ret` in an .entry kernel exits the thread -> AEC HALT (completes
+  // the warp). A real RET pops the call stack, which is empty at kernel level
+  // -> execution error on the golden. (The golden's own images end in HALT.)
+  if (m == "ret") { ir::Inst in; in.op = Op::HALT; emit(in); return; }
   if (m == "exit"){ ir::Inst in; in.op = Op::HALT; emit(in); return; }
 
-  // Unknown mnemonic: leave a breadcrumb so objdump/verbose can flag it, but
-  // do not fabricate an opcode (0x0000 is not a NOP on AEC).
+  // Unknown mnemonic: RECORD it (so the driver fails loudly by default rather
+  // than emitting silently-wrong code) and leave a breadcrumb for --lenient.
+  fn->unhandled.push_back(m);
   ir::Inst in;
   in.op = Op::CPY; in.type = Type::B32;
   if (!s.operands.empty() && s.operands[0].kind == ptx::Operand::Reg) {
@@ -407,7 +436,7 @@ void Builder::run(const ptx::Kernel &k) {
   if (fn->blocks.empty()) { ir::BasicBlock b; fn->blocks.push_back(b); }
   ir::BasicBlock &last = fn->blocks.back();
   if (last.insts.empty() || !last.insts.back().isTerminator()) {
-    ir::Inst r; r.op = Op::RET; last.insts.push_back(r);
+    ir::Inst r; r.op = Op::HALT; last.insts.push_back(r);  // kernel exit = HALT.
   }
 }
 

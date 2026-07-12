@@ -84,6 +84,10 @@ struct Function {
   // Diagnostics filled by the back end (surfaced in the perf report).
   uint32_t instructionCount = 0;
   uint32_t dualIssuePairs   = 0;
+
+  // PTX mnemonics the front end did not lower (compile fails unless --lenient),
+  // so an unsupported op is a loud error, never silently-wrong code.
+  std::vector<std::string> unhandled;
 };
 
 struct Program {

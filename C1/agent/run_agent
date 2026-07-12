@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Submission entry point `agent/run_agent` (the grader invokes this path).
+# Thin wrapper so the autonomous auto-tuning agent runs without a .py suffix.
+exec python3 "$(dirname "$0")/run_agent.py" "$@"

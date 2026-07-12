@@ -43,6 +43,7 @@ struct Options {
   int  unroll_factor = 4;     // unroll count for counted loops.
 
   bool verbose      = false;  // dump pipeline progress to stderr.
+  bool lenient      = false;  // keep going past unhandled PTX ops (default: fail).
 
   // Derive the boolean pass switches from an -O level.
   void applyOptLevel(OptLevel level) {

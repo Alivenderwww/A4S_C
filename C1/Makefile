@@ -29,11 +29,20 @@ OD_OBJ := obj/tools/aec-objdump.o
 CC_BIN := bin/aec-cc$(EXE)
 OD_BIN := bin/aec-objdump$(EXE)
 
-.PHONY: all build test clean selftest
-all: build
+.PHONY: all build submit test clean selftest
+all: build submit
 
 build: $(CC_BIN) $(OD_BIN)
 	@echo "built with -std=$(CXXSTD): $(CC_BIN) $(OD_BIN)"
+
+# Place the required submission entry points at the paths the grader invokes:
+#   compiler/aec-cc  disassembler/aec-objdump  agent/run_agent
+submit: build
+	@mkdir -p compiler disassembler
+	@cp $(CC_BIN) compiler/aec-cc$(EXE)
+	@cp $(OD_BIN) disassembler/aec-objdump$(EXE)
+	@chmod +x agent/run_agent 2>/dev/null || true
+	@echo "submission entry points ready: compiler/aec-cc  disassembler/aec-objdump  agent/run_agent"
 
 $(CC_BIN): $(LIB_OBJ) $(CC_OBJ)
 	@mkdir -p bin

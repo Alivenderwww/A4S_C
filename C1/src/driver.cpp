@@ -96,6 +96,21 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
   prog = buildIR(m, opt);
   if (prog.functions.empty()) { err = "no kernel to compile"; return false; }
 
+  // Fail loudly on any PTX op we did not lower (never emit silently-wrong code).
+  if (!opt.lenient) {
+    std::string bad;
+    for (unsigned i = 0; i < prog.functions.size(); ++i)
+      for (unsigned k = 0; k < prog.functions[i].unhandled.size(); ++k) {
+        if (!bad.empty()) bad += ", ";
+        bad += prog.functions[i].unhandled[k];
+      }
+    if (!bad.empty()) {
+      err = "unhandled PTX op(s): " + bad + "  (add a lowering in ir_builder.cpp, "
+            "or pass --lenient to emit a placeholder)";
+      return false;
+    }
+  }
+
   // The scaffold emits the first kernel as the image entry (public tests are
   // single-kernel). TODO: emit every kernel with per-kernel symbols.
   ir::Function &fn = prog.functions[0];

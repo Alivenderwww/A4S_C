@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
     if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
     else if (a == "--selftest") { return isa::selfTest() ? 0 : 1; }
     else if (a == "-v" || a == "--verbose") { opt.verbose = true; }
+    else if (a == "--lenient") { opt.lenient = true; }
     else if (a == "-O0") { opt.applyOptLevel(OptLevel::O0); }
     else if (a == "-O2") { opt.applyOptLevel(OptLevel::O2); }
     else if (a == "-O3") { opt.applyOptLevel(OptLevel::O3); }
