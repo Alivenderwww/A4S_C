@@ -1,0 +1,254 @@
+{
+  "cases": [
+    {
+      "case_id": "pub-r101-abi-tls",
+      "category": "abi-error",
+      "expected": "ABI/ISA v2/v1 and TLS isolation",
+      "input_region": "one device; two threads",
+      "oracle": "exact metadata/error state",
+      "required_device_evidence": [],
+      "requirement": "R101",
+      "seed": 101,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r102-allocator",
+      "category": "lifecycle",
+      "expected": "reuse and invalid double free",
+      "input_region": "1 KiB and OOM",
+      "oracle": "exact status/address",
+      "required_device_evidence": [],
+      "requirement": "R102",
+      "seed": 102,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r103-copy",
+      "category": "bounds",
+      "expected": "round trip and exact errors",
+      "input_region": "16-byte allocation-relative spans",
+      "oracle": "byte equality/status",
+      "required_device_evidence": [
+        "dma_commands"
+      ],
+      "requirement": "R103",
+      "seed": 103,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r104-vector-image",
+      "category": "isa-mapping",
+      "expected": "vector sum, resolved image handle/digest, and launch rejection boundaries",
+      "input_region": "5 FP32 values; grid 1; block 32; frozen B image tuple",
+      "oracle": "independent FP32 plus frozen image manifest",
+      "required_device_evidence": [
+        "isa_launches",
+        "instructions_retired",
+        "last_kernel_handle",
+        "last_trace_digest"
+      ],
+      "requirement": "R104",
+      "seed": 104,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r105-stream-fifo",
+      "category": "concurrency",
+      "expected": "FIFO byte equality",
+      "input_region": "one stream H2D then D2H",
+      "oracle": "byte equality",
+      "required_device_evidence": [
+        "submitted_commands"
+      ],
+      "requirement": "R105",
+      "seed": 105,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r106-events",
+      "category": "event-fault",
+      "expected": "positive cycles and async error",
+      "input_region": "two event generations and DMA fault",
+      "oracle": "event generation/status",
+      "required_device_evidence": [
+        "total_virtual_cycles"
+      ],
+      "requirement": "R106",
+      "seed": 106,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r201-core-gemm",
+      "category": "numeric-isa",
+      "expected": "typed GEMM result and matching resolved image",
+      "input_region": "2x3x3 FP32/INT32 through B TLDA/TMUL/TSTA images",
+      "oracle": "independent ordered scalar plus frozen image manifest",
+      "required_device_evidence": [
+        "isa_launches",
+        "instructions_retired",
+        "last_kernel_handle",
+        "last_trace_digest"
+      ],
+      "requirement": "R201",
+      "seed": 201,
+      "target_mutants": [],
+      "timeout_ms": 3000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r202-low-precision",
+      "category": "numeric-encoding",
+      "expected": "canonical encoded output",
+      "input_region": "all floating storage formats",
+      "oracle": "independent codec/scalar GEMM",
+      "required_device_evidence": [
+        "instructions_retired"
+      ],
+      "requirement": "R202",
+      "seed": 202,
+      "target_mutants": [],
+      "timeout_ms": 3000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r203-packed-integer",
+      "category": "numeric-packed",
+      "expected": "exact INT32 output",
+      "input_region": "INT4/INT8 packed inputs",
+      "oracle": "wide integer scalar",
+      "required_device_evidence": [
+        "instructions_retired"
+      ],
+      "requirement": "R203",
+      "seed": 203,
+      "target_mutants": [],
+      "timeout_ms": 3000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r204-vector-reduction",
+      "category": "numeric-reduction",
+      "expected": "AXPY/DOT/NRM2 ordered result",
+      "input_region": "five FP32 values",
+      "oracle": "independent ordered FP32",
+      "required_device_evidence": [
+        "isa_launches",
+        "instructions_retired",
+        "last_trace_digest"
+      ],
+      "requirement": "R204",
+      "seed": 204,
+      "target_mutants": [],
+      "timeout_ms": 3000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r301-command-accounting",
+      "category": "device-abi",
+      "expected": "strict command/stat accounting",
+      "input_region": "H2D/H2D/ISA/D2H",
+      "oracle": "author device completion/stats",
+      "required_device_evidence": [
+        "submitted_commands",
+        "isa_launches",
+        "instructions_retired",
+        "last_kernel_handle",
+        "last_trace_digest"
+      ],
+      "requirement": "R301",
+      "seed": 301,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r302-two-channel",
+      "category": "dma-recovery",
+      "expected": "both channels and recovery",
+      "input_region": "two streams and async bad span",
+      "oracle": "author DMA stats/status",
+      "required_device_evidence": [
+        "channel_commands"
+      ],
+      "requirement": "R302",
+      "seed": 302,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r303-registration",
+      "category": "registration",
+      "expected": "registration lifecycle and lower cycles",
+      "input_region": "64 KiB exact host range",
+      "oracle": "author DMA model",
+      "required_device_evidence": [
+        "zero_copy_commands",
+        "last_virtual_cycles"
+      ],
+      "requirement": "R303",
+      "seed": 303,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r304-fault-recovery",
+      "category": "fault",
+      "expected": "propagation and recovery",
+      "input_region": "next DMA and next ISA launch",
+      "oracle": "injected fault status",
+      "required_device_evidence": [
+        "submitted_commands"
+      ],
+      "requirement": "R304",
+      "seed": 304,
+      "target_mutants": [],
+      "timeout_ms": 2000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r401-dma-policy",
+      "category": "agent-diagnostic",
+      "expected": "legal exact JSON; diagnostic only",
+      "input_region": "three public DMA regions",
+      "oracle": "normative DMA cycle model",
+      "required_device_evidence": [],
+      "requirement": "R401",
+      "seed": 401,
+      "target_mutants": [],
+      "timeout_ms": 1000,
+      "visibility": "public"
+    },
+    {
+      "case_id": "pub-r402-image-policy",
+      "category": "agent-diagnostic",
+      "expected": "legal manifest image; diagnostic only",
+      "input_region": "three public shapes",
+      "oracle": "author AEC image interpreter",
+      "required_device_evidence": [
+        "instructions_retired",
+        "trace_digest"
+      ],
+      "requirement": "R402",
+      "seed": 402,
+      "target_mutants": [],
+      "timeout_ms": 1000,
+      "visibility": "public"
+    }
+  ],
+  "schema_version": 1,
+  "visibility": "public"
+}

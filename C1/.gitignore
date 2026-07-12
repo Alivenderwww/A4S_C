@@ -1,0 +1,6 @@
+# Build artifacts
+/obj/
+/bin/
+*.o
+*.d
+*.aecbin

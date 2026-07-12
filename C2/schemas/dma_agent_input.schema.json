@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "alignment": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "bytes": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "case_id": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "concurrency": {
+      "maximum": 64,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "direction": {
+      "enum": [
+        "h2d",
+        "d2h"
+      ]
+    },
+    "registered": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "case_id",
+    "direction",
+    "bytes",
+    "alignment",
+    "registered",
+    "concurrency"
+  ],
+  "title": "AEC DMA Agent input",
+  "type": "object"
+}

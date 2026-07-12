@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "alignment": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "candidates": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "alignment": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "diagnostic_cycles": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "divisibility": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "image_id": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "semantic_kernel_id": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "variant": {
+            "enum": [
+              1,
+              2,
+              3
+            ]
+          },
+          "workspace": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "semantic_kernel_id",
+          "image_id",
+          "variant",
+          "workspace",
+          "alignment",
+          "divisibility"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "case_id": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "dtype": {
+      "type": "string"
+    },
+    "k": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "m": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "n": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "workspace": {
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "case_id",
+    "dtype",
+    "m",
+    "n",
+    "k",
+    "alignment",
+    "workspace",
+    "candidates"
+  ],
+  "title": "AEC Kernel Agent input",
+  "type": "object"
+}

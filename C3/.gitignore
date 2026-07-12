@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+benchmarks/c32_c33/results/
+*.dag.json

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "channel": {
+      "enum": [
+        0,
+        1
+      ]
+    },
+    "chunk_bytes": {
+      "enum": [
+        4096,
+        65536,
+        1048576
+      ]
+    },
+    "queue_depth": {
+      "enum": [
+        1,
+        2,
+        4,
+        8
+      ]
+    },
+    "use_zero_copy": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "chunk_bytes",
+    "queue_depth",
+    "channel",
+    "use_zero_copy"
+  ],
+  "title": "AEC DMA Agent output",
+  "type": "object"
+}

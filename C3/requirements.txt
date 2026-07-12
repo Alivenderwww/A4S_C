@@ -1,0 +1,14 @@
+# C3 算子调度与模型部署 — 依赖
+# 安装：pip install -r requirements.txt
+#
+# CPU 环境（自测 / C3.1 / C3.3 数值对齐）足够：
+numpy>=1.24
+onnx>=1.15
+onnxruntime>=1.17          # CPU 版；评测机若有 GPU 请改用 onnxruntime-gpu
+#
+# GPU 环境（C3.5 正式评测，追求运行时间/显存排名）：
+#   pip uninstall onnxruntime
+#   pip install onnxruntime-gpu   # 需与评测机 CUDA/cuDNN 版本匹配
+#
+# 说明：tools/infer.py 会自动探测 CUDAExecutionProvider，找不到则回退 CPU，
+#       再回退 onnx.reference.ReferenceEvaluator（无需 onnxruntime 也能跑，但很慢）。

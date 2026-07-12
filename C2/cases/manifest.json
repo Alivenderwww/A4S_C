@@ -1,0 +1,38 @@
+{
+  "profiles": {
+    "public": "public_cases.json"
+  },
+  "required_fields": [
+    "case_id",
+    "requirement",
+    "visibility",
+    "category",
+    "seed",
+    "input_region",
+    "expected",
+    "oracle",
+    "timeout_ms",
+    "required_device_evidence",
+    "target_mutants"
+  ],
+  "requirements": [
+    "R101",
+    "R102",
+    "R103",
+    "R104",
+    "R105",
+    "R106",
+    "R201",
+    "R202",
+    "R203",
+    "R204",
+    "R301",
+    "R302",
+    "R303",
+    "R304",
+    "R401",
+    "R402"
+  ],
+  "schema_version": 1,
+  "visibility": "student-public"
+}

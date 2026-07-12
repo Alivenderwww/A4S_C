@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "source_repository": "git@github.com:BinaryCheater/simple-gpgpu.git",
+  "source_branch": "main",
+  "source_commit": "d07008f945aa34ca09978c3afde95660ba19125a",
+  "instruction_bytes": 16,
+  "opcodes": {
+    "ADD": 1, "SUB": 2, "MUL": 3, "MAD": 4, "FMA": 5,
+    "DIV": 6, "NEG": 7, "ABS": 8, "MIN": 9, "MAX": 10,
+    "AND": 16, "OR": 17, "XOR": 18, "NOT": 19, "SHL": 20,
+    "SHR": 21, "BFX": 22, "BINS": 23, "POPC": 24, "FLO": 25,
+    "CMP": 32, "CMPP": 33, "SEL": 34, "PICK": 35,
+    "LD": 48, "ST": 49, "LDC": 50, "ATOM": 51,
+    "BR": 64, "BRX": 65, "JMP": 66, "CALL": 67, "RET": 68,
+    "HALT": 69, "SSYNC": 70, "SYNC_CT": 71, "SYNC_WG": 72, "MBAR": 73,
+    "LOADI": 80, "CPY": 81, "LOADI64": 82, "CVTFF": 83,
+    "CVTFI": 84, "CVTIF": 85, "CVTII": 86, "SHUF": 87,
+    "VOTE": 88, "MTCH": 89,
+    "TMUL": 96, "TMUL_S": 97, "TLDA": 98, "TSTA": 99,
+    "TMOV": 100, "TDUP": 101,
+    "RCP": 112, "RSQ": 113, "SIN": 114, "COS": 115,
+    "EXP": 116, "LOG": 117, "SQRT": 118,
+    "RDTSC": 128, "RDPMC": 129
+  },
+  "types": {
+    "FP32": 0, "FP64": 1, "FP16": 2, "BF16": 3,
+    "FP8_E4M3": 4, "FP8_E5M2": 5, "FP4_E2M1": 6,
+    "S32": 7, "U32": 8, "S8": 9, "U8": 10,
+    "S4": 11, "U4": 12, "B32": 13, "B64": 14
+  },
+  "special_registers": {
+    "TID_X": 256, "NTID_X": 257, "CTAID_X": 258, "NCTAID_X": 259,
+    "LANEID": 260, "WARPID": 261,
+    "TID_Y": 272, "NTID_Y": 273, "CTAID_Y": 274, "NCTAID_Y": 275,
+    "TID_Z": 288, "NTID_Z": 289, "CTAID_Z": 290, "NCTAID_Z": 291
+  },
+  "golden_vectors": [
+    {"name": "ADD.f32@P3 R1,R2,R3,R4", "words_le": [4, 3, 65538, 98307]},
+    {"name": "LOADI.u32 R7,0x11223344", "words_le": [287454020, 0, 458752, 5242944]},
+    {"name": "CPY.u32 R1,%tid.x", "words_le": [0, 0, 65792, 5308480]},
+    {"name": "CMPP.ge.u32 P2,R10,R6", "words_le": [0, 6, 131082, 2164032]},
+    {"name": "BRX P2,9", "words_le": [9, 0, 0, 4259842]},
+    {"name": "ST.gmem.f32 [R4],R6", "words_le": [0, 6, 4, 3211264]},
+    {"name": "TMUL.f16 R64,R32,R48,R64", "words_le": [64, 48, 4194336, 6291728]},
+    {"name": "TSTA.f16 [R4],R64", "words_le": [0, 64, 4, 6488080]}
+  ],
+  "c2_extensions": {
+    "pmem_selector": 4,
+    "fp8_e5m2_tmul_extended_selector": 2
+  }
+}
