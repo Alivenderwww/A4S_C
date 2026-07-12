@@ -103,8 +103,9 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
   buildCFG(fn);
   runOptPasses(fn, opt);
   if (opt.gemm_tmul) codegen::lowerGemmToTmul(fn, opt);
+  if (opt.unroll) passes::unrollLoops(fn, opt);   // expose independent loads (-O3).
+  sched::listSchedule(fn, opt);   // pre-RA: schedule on vregs (fewer false deps).
   regalloc::linearScan(fn, opt);
-  sched::listSchedule(fn, opt);
 
   std::vector<ir::Inst> flat = codegen::lower(fn, opt);
 

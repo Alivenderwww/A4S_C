@@ -52,6 +52,19 @@ Type mapType(const std::string &s) {
   return Type::NONE;
 }
 
+bool isFloatType(Type t) {
+  return t == Type::F32 || t == Type::F64 || t == Type::F16 || t == Type::BF16 ||
+         t == Type::F8E4M3 || t == Type::F8E5M2 || t == Type::F4E2M1;
+}
+
+// AEC addresses are 32-bit byte offsets and there is no 64-bit integer ALU
+// (ADD/SUB/MUL have no .b64). PTX uses .u64/.b64 only for pointer arithmetic,
+// so collapse those to 32-bit low-word ops: LD of a .u64 param reads the low
+// 32 bits (a valid <4 GiB offset) into a single register, and add/sub/mul on
+// pointers become 32-bit. This also avoids the illegal ADD.b64 and the b64
+// register-pair clobber (a pair def writes {Rd,Rd+1}). See §1.2.
+Type narrowAddr(Type t) { return t == Type::B64 ? Type::U32 : t; }
+
 // First type-looking modifier ("mad.lo.u32" -> u32; "cvt.f32.f16" -> f32).
 Type typeOfMods(const std::vector<std::string> &mods) {
   for (unsigned i = 0; i < mods.size(); ++i)
@@ -190,6 +203,7 @@ struct Builder {
 
   void lowerBinary(Op opc, Type ty, const ptx::Instruction &s) {
     if (s.operands.size() < 3) return;
+    ty = narrowAddr(ty);                       // 64-bit pointer math -> 32-bit.
     ir::Inst in;
     in.op = opc; in.type = ty;
     in.dst = ir::Operand::reg(regFor(s.operands[0].name));
@@ -225,7 +239,7 @@ void Builder::translate(const ptx::Instruction &s) {
       if (s.mods[i] == "shared") isShared = true;
     }
     ir::Inst in;
-    in.op = Op::LD; in.type = ty == Type::NONE ? Type::B32 : ty;
+    in.op = Op::LD; in.type = narrowAddr(ty == Type::NONE ? Type::B32 : ty);
     in.dst = ir::Operand::reg(regFor(s.operands[0].name));
     if (isParam) {
       in.modifier = (uint32_t)Space::PMEM;
@@ -267,7 +281,7 @@ void Builder::translate(const ptx::Instruction &s) {
       in.op = Op::CPY; in.type = ty == Type::NONE ? Type::U32 : ty;
       in.s1 = ir::Operand::special(specialSelector(src.name));
     } else if (src.kind == ptx::Operand::Reg) {
-      in.op = Op::CPY; in.type = ty == Type::NONE ? Type::B32 : ty;
+      in.op = Op::CPY; in.type = narrowAddr(ty == Type::NONE ? Type::B32 : ty);
       in.s1 = ir::Operand::reg(regFor(src.name));
     } else { // Imm / FloatImm
       in.op = Op::LOADI; in.type = ty == Type::NONE ? Type::U32 : ty;
@@ -277,7 +291,9 @@ void Builder::translate(const ptx::Instruction &s) {
     return;
   }
 
-  if (m == "mad")  { lowerFMA(Op::MAD, ty, s); return; }
+  // PTX mad.f32 on sm_70 is FUSED (single rounding = fma); only integer mad
+  // maps to AEC MAD (mul rounds, then add rounds). See C1_实现流程分析.md §1.5.
+  if (m == "mad")  { lowerFMA(isFloatType(ty) ? Op::FMA : Op::MAD, ty, s); return; }
   if (m == "fma")  { lowerFMA(Op::FMA, ty, s); return; }
 
   if (m == "add")  { lowerBinary(Op::ADD, ty, s); return; }
@@ -307,14 +323,18 @@ void Builder::translate(const ptx::Instruction &s) {
   if (m == "cvt") {
     if (s.operands.size() < 2) return;
     ir::Inst in;
-    Type dstT = ty;
+    Type dstT = ty == Type::NONE ? Type::F32 : ty;
     Type srcT = secondTypeOfMods(s.mods);
-    // Pick a conversion opcode by src/dst kind (float vs int) — skeleton uses
-    // CVTFF for f<->f and CVTII otherwise; refine per real numeric rules.
-    in.op = Op::CVTFF;
-    in.type = dstT == Type::NONE ? Type::F32 : dstT;
+    if (srcT == Type::NONE) srcT = Type::F32;
+    // Opcode by float/int kind of (dst, src); source type must be ENCODED
+    // (goes to Pred/Ctrl[13:10] via modifier) — dropping it made the golden
+    // read cvt.f32.f16 as a no-op f32 copy. See C1_实现流程分析.md §1.4.
+    bool df = isFloatType(dstT), sf = isFloatType(srcT);
+    in.op = df ? (sf ? Op::CVTFF : Op::CVTIF) : (sf ? Op::CVTFI : Op::CVTII);
+    in.type = dstT;
+    in.modifier = (uint32_t)srcT;   // encoded as source type in [13:10].
     in.dst = ir::Operand::reg(regFor(s.operands[0].name));
-    in.s1  = asReg(s.operands[1], srcT == Type::NONE ? Type::F16 : srcT);
+    in.s1  = asReg(s.operands[1], srcT);
     in.note = "cvt";
     emit(in);
     return;

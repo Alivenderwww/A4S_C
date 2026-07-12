@@ -4,3 +4,8 @@
 *.o
 *.d
 *.aecbin
+
+# Sim / bench / agent working dirs (regenerated)
+/sim/build/
+__pycache__/
+/agent/_agent_work/

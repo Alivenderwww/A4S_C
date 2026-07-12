@@ -33,6 +33,9 @@ bool memCoalesce(ir::Function &fn, const Options &opt);  // mem_coalesce.cpp
 // --- Predicate optimization (scoring category T2). ------------------------
 bool predOpt(ir::Function &fn, const Options &opt);      // pred_opt.cpp
 
+// --- Loop unrolling: expose independent loads for latency hiding (T4). -----
+bool unrollLoops(ir::Function &fn, const Options &opt);  // unroll.cpp
+
 } // namespace passes
 
 // --- Register allocation (scoring category T4). ---------------------------

@@ -39,6 +39,8 @@ struct Options {
   bool dual_issue   = true;   // list scheduler pairs independent ops.
   bool gemm_tmul    = true;   // detect GEMM idiom and lower to TMUL.
   int  sched_window = 16;     // list-scheduler lookahead (instructions).
+  bool unroll       = false;  // loop unrolling (opt-in, -O3): expose ILP.
+  int  unroll_factor = 4;     // unroll count for counted loops.
 
   bool verbose      = false;  // dump pipeline progress to stderr.
 
@@ -51,6 +53,7 @@ struct Options {
     dual_issue = on;
     gemm_tmul  = true;                 // lowering correctness, always on.
     sched_window = (level == OptLevel::O3) ? 32 : 16;
+    unroll = (level == OptLevel::O3);  // unrolling is opt-in at -O3 only.
   }
 };
 

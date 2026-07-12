@@ -64,6 +64,9 @@ int main(int argc, char **argv) {
     else if (a == "--no-pred-opt") { opt.pred_opt = false; }
     else if (a == "--no-dual-issue") { opt.dual_issue = false; }
     else if (a == "--no-gemm") { opt.gemm_tmul = false; }
+    else if (a == "--unroll") { opt.unroll = true; }
+    else if (a == "--no-unroll") { opt.unroll = false; }
+    else if (a == "--unroll-factor") { if (i + 1 < argc) opt.unroll_factor = std::atoi(argv[++i]); }
     else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "aec-cc: unknown option '%s'\n", a.c_str());
       usage(argv[0]);

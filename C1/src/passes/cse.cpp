@@ -8,7 +8,7 @@
 #include "aec/passes.h"
 
 #include <map>
-#include <string>
+#include <vector>
 
 namespace aec {
 namespace passes {
@@ -17,55 +17,134 @@ namespace {
 bool isPure(const ir::Inst &in) {
   if (in.isTerminator()) return false;
   switch (in.op) {
-    case ir::Op::LD: case ir::Op::ST: case ir::Op::ATOM:
+    case ir::Op::LD: case ir::Op::ST: case ir::Op::ATOM: case ir::Op::LDC:
     case ir::Op::CMPP: case ir::Op::CMP:
-    case ir::Op::SYNC_WG: case ir::Op::SYNC_CT:
-    case ir::Op::TMUL: case ir::Op::TLDA: case ir::Op::TSTA:
+    case ir::Op::SYNC_WG: case ir::Op::SYNC_CT: case ir::Op::SSYNC:
+    case ir::Op::MBAR:
+    case ir::Op::TMUL: case ir::Op::TMUL_S: case ir::Op::TLDA:
+    case ir::Op::TSTA: case ir::Op::TMOV: case ir::Op::TDUP:
       return false;
     default:
-      return true; // ADD/SUB/MUL/MAD/AND/... are pure.
+      return true; // ADD/SUB/MUL/MAD/AND/CPY/LOADI/... are pure.
   }
 }
 
-std::string opKey(const ir::Inst &in) {
-  // A textual value-number key over (op,type,src operands).
-  std::string k;
-  k += (char)((int)in.op & 0xff);
-  k += (char)((int)in.type & 0xff);
-  const ir::Operand *s[3] = {&in.s1, &in.s2, &in.s3};
-  for (int i = 0; i < 3; ++i) {
-    k += (char)('0' + (int)s[i]->kind);
-    uint32_t v = s[i]->value;
-    for (int b = 0; b < 4; ++b) k += (char)((v >> (b * 8)) & 0xff);
-  }
-  return k;
+// One available (already-computed) value in the current block.
+struct Avail {
+  ir::Op op; ir::Type ty;
+  ir::Operand s1, s2, s3;
+  bool hasImm; uint32_t imm;   // LOADI etc. distinguish by immediate.
+  uint32_t dst;                // vreg holding the value.
+};
+
+bool sameOperand(const ir::Operand &a, const ir::Operand &b) {
+  return a.kind == b.kind && a.value == b.value;
+}
+bool opUses(const ir::Operand &o, uint32_t r) {
+  return o.kind == ir::Operand::Reg && o.value == r;
 }
 } // namespace
 
+// Local (per-block) common-subexpression elimination via value numbering.
+// The IR is NOT SSA (a PTX reg can be redefined), so availability is
+// invalidated whenever any operand/def register is rewritten.
 bool cse(ir::Function &fn, const Options &opt) {
   if (!opt.cse) return false;
   bool changed = false;
 
+  // Which block each vreg is used in: block index, or -1 if used in more than
+  // one. LOCAL (per-block) CSE may only eliminate a definition whose value is
+  // used solely within the current block — otherwise the per-block rename can't
+  // reach cross-block uses and leaves a dangling reference.
+  std::map<uint32_t, int> useBlock;
+  for (unsigned bi = 0; bi < fn.blocks.size(); ++bi) {
+    for (unsigned ii = 0; ii < fn.blocks[bi].insts.size(); ++ii) {
+      const ir::Inst &in = fn.blocks[bi].insts[ii];
+      const ir::Operand *srcs[3] = {&in.s1, &in.s2, &in.s3};
+      for (int k = 0; k < 3; ++k) {
+        if (srcs[k]->kind != ir::Operand::Reg) continue;
+        std::map<uint32_t, int>::iterator it = useBlock.find(srcs[k]->value);
+        if (it == useBlock.end()) useBlock[srcs[k]->value] = (int)bi;
+        else if (it->second != (int)bi) it->second = -1;
+      }
+    }
+  }
+
   for (unsigned bi = 0; bi < fn.blocks.size(); ++bi) {
     ir::BasicBlock &b = fn.blocks[bi];
-    std::map<std::string, uint32_t> avail; // value key -> defining vreg.
+    std::vector<Avail> avail;
+    std::map<uint32_t, uint32_t> rename;  // CSE'd vreg -> canonical vreg.
+    std::vector<ir::Inst> kept;
+    kept.reserve(b.insts.size());
 
     for (unsigned ii = 0; ii < b.insts.size(); ++ii) {
-      ir::Inst &in = b.insts[ii];
-      if (!isPure(in) || in.dst.kind != ir::Operand::Reg) continue;
+      ir::Inst in = b.insts[ii];
 
-      std::string key = opKey(in);
-      std::map<std::string, uint32_t>::iterator it = avail.find(key);
-      if (it != avail.end()) {
-        // TODO(T2): replace this instruction with a CPY from it->second, and
-        // rewrite later uses of in.dst to it->second, then set changed=true.
-        (void)it;
-      } else {
-        avail[key] = in.dst.value;
+      // Rewrite source operands to their canonical (CSE'd) registers.
+      ir::Operand *srcs[3] = {&in.s1, &in.s2, &in.s3};
+      for (int k = 0; k < 3; ++k) {
+        if (srcs[k]->kind == ir::Operand::Reg) {
+          std::map<uint32_t, uint32_t>::iterator r = rename.find(srcs[k]->value);
+          if (r != rename.end()) srcs[k]->value = r->second;
+        }
       }
-      // TODO(T2): invalidate `avail` entries whose operands were just
-      // redefined (needed once rewriting is enabled).
+
+      // Redundant pure computation? -> alias its dst to the earlier one, drop it.
+      if (isPure(in) && in.dst.kind == ir::Operand::Reg) {
+        int found = -1;
+        for (unsigned a = 0; a < avail.size(); ++a) {
+          if (avail[a].op == in.op && avail[a].ty == in.type &&
+              avail[a].hasImm == in.hasImm && avail[a].imm == in.imm &&
+              sameOperand(avail[a].s1, in.s1) &&
+              sameOperand(avail[a].s2, in.s2) &&
+              sameOperand(avail[a].s3, in.s3)) { found = (int)a; break; }
+        }
+        // Only eliminate if this value is not used in any other block.
+        std::map<uint32_t, int>::iterator ub = useBlock.find(in.dst.value);
+        bool localOnly = (ub == useBlock.end()) || ub->second == (int)bi;
+        if (found >= 0 && localOnly) {
+          rename[in.dst.value] = avail[found].dst;
+          changed = true;
+          continue;                       // drop the redundant instruction.
+        }
+      }
+
+      // Kept instruction. If it defines a register, its new value invalidates
+      // any availability / rename that referenced that register (and, for a
+      // 64-bit pair destination, the high half too).
+      if (in.dst.kind == ir::Operand::Reg) {
+        uint32_t D = in.dst.value;
+        bool pair = (in.type == ir::Type::B64 || in.type == ir::Type::F64);
+        uint32_t D1 = (D + 1) & 0xff;
+        std::vector<Avail> na;
+        na.reserve(avail.size());
+        for (unsigned a = 0; a < avail.size(); ++a) {
+          const Avail &e = avail[a];
+          bool hit = e.dst == D || opUses(e.s1, D) || opUses(e.s2, D) || opUses(e.s3, D);
+          if (pair)
+            hit = hit || e.dst == D1 || opUses(e.s1, D1) || opUses(e.s2, D1) || opUses(e.s3, D1);
+          if (!hit) na.push_back(e);
+        }
+        avail.swap(na);
+
+        rename.erase(D);
+        if (pair) rename.erase(D1);
+        for (std::map<uint32_t, uint32_t>::iterator it = rename.begin(); it != rename.end(); ) {
+          if (it->second == D || (pair && it->second == D1)) rename.erase(it++);
+          else ++it;
+        }
+
+        if (isPure(in)) {
+          Avail e; e.op = in.op; e.ty = in.type; e.s1 = in.s1; e.s2 = in.s2;
+          e.s3 = in.s3; e.hasImm = in.hasImm; e.imm = in.imm; e.dst = D;
+          avail.push_back(e);
+        }
+      }
+
+      kept.push_back(in);
     }
+
+    b.insts.swap(kept);
   }
 
   return changed;

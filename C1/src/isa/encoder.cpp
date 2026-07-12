@@ -76,6 +76,12 @@ Word128 encode(const Fields &f) {
     }
   } else if (f.op == Op::TLDA || f.op == Op::TSTA) {
     pred_ctrl |= static_cast<uint16_t>((f.modifier & kFamilyMask) << kFamilyShift);
+  } else if (f.op == Op::CVTFF || f.op == Op::CVTFI ||
+             f.op == Op::CVTIF || f.op == Op::CVTII) {
+    // CVT*: destination type is already in [6:3] (from f.type); the SOURCE type
+    // goes in [13:10] (f.modifier carries it), with [9:7]=0. Field layout per
+    // Track-B §5.4 — assumed identical for the C-track (confirm w/ organizers).
+    pred_ctrl |= static_cast<uint16_t>((f.modifier & 0xfu) << 10);
   } else if (f.op == Op::MBAR) {
     pred_ctrl |= static_cast<uint16_t>((f.modifier & 0x3u) << kFamilyShift);
   }
