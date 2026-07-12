@@ -21,6 +21,7 @@ C3 算子调度 : ONNX 模型    ──►  AEC GPGPU 推理
 
 | 文档 | 用途 |
 |------|------|
+| [`docs/术语表.md`](./docs/术语表.md) | **专业词汇通俗解释**（编译器/GPU/ONNX/精度/框架…），读文档卡词时先查这里 |
 | [`docs/Track-C-Reading-Notes.md`](./docs/Track-C-Reading-Notes.md) | 主体笔记：C1/C2/C3 摘要 + §6 联网调研背景（PTX / ONNX / CUDA / GEMM+Tensor Core / 算子融合 / 内存规划 / MLIR / SSA） |
 | [`docs/赛道C-知识库与作战手册.md`](./docs/赛道C-知识库与作战手册.md) | 知识库 + 赛题解析对齐：实际交付物核对、可复用资料清单、三天节奏、待向组委会确认的问题 |
 | [`public/Track-C/README.md`](./public/Track-C/README.md) | 官方赛题入口 |
