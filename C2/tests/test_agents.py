@@ -5,6 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents"))
 from dma_agent import decide as dma_decide
+from kernel_agent import decide as kernel_decide
 
 
 # --- DMA cycle formula (mirrors grader _dma_cycles, doc 05 sec 3) ---
@@ -58,6 +59,65 @@ def test_dma_optimal_against_exhaustive_search():
         action = dma_decide(req)
         best = min(_dma_cycles(req, a) for a in _all_legal_actions(req))
         assert _dma_cycles(req, action) == best, (req, action, best)
+
+
+# --- Kernel agent ---
+def _kernel_candidates():
+    return [
+        {"id": "naive", "semantic_kernel_id": 10, "image_id": 0, "variant": 1,
+         "workspace": 0, "alignment": 1, "divisibility": 1},
+        {"id": "tiled", "semantic_kernel_id": 11, "image_id": 0, "variant": 2,
+         "workspace": 4096, "alignment": 1, "divisibility": 4},
+        {"id": "vectorized", "semantic_kernel_id": 12, "image_id": 0, "variant": 3,
+         "workspace": 8192, "alignment": 16, "divisibility": 8},
+    ]
+
+
+def _krequest(m, n, k, alignment, workspace, inject=None):
+    cands = _kernel_candidates()
+    if inject is not None:
+        cands = [dict(c, diagnostic_cycles=inject[c["id"]]) if c["id"] in inject else dict(c)
+                 for c in cands]
+    return {"case_id": 0, "dtype": "fp32", "m": m, "n": n, "k": k,
+            "alignment": alignment, "workspace": workspace, "candidates": cands}
+
+
+def test_kernel_diagnostic_picks_min_cycles():
+    # vec legal (32/64/16 all %8==0); injected cycles: vec smallest
+    req = _krequest(32, 64, 16, 64, 8192,
+                    inject={"naive": 1115, "tiled": 731, "vectorized": 603})
+    assert kernel_decide(req)["kernel_id"] == "vectorized"
+
+
+def test_kernel_diagnostic_ignores_illegal_candidate():
+    # vec illegal (20%8!=0); even with a fake tiny cycle it must not be picked
+    req = _krequest(20, 12, 28, 16, 4096,
+                    inject={"naive": 543, "tiled": 351, "vectorized": 1})
+    assert kernel_decide(req)["kernel_id"] == "tiled"
+
+
+def test_kernel_hidden_picks_highest_legal_variant():
+    # no diagnostic_cycles; vec legal (64/64/64 %8==0, align16>=16, ws8192>=8192)
+    req = _krequest(64, 64, 64, 16, 8192)
+    assert kernel_decide(req)["kernel_id"] == "vectorized"
+
+
+def test_kernel_hidden_falls_back_to_tiled_when_vec_illegal():
+    # 36%8!=0 but 36%4==0; tiled legal
+    req = _krequest(36, 36, 36, 16, 8192)
+    assert kernel_decide(req)["kernel_id"] == "tiled"
+
+
+def test_kernel_hidden_only_naive_legal():
+    # 7%4!=0 -> tiled illegal; align8<16 -> vec illegal
+    req = _krequest(7, 9, 5, 8, 0)
+    assert kernel_decide(req)["kernel_id"] == "naive"
+
+
+def test_kernel_workspace_filters_tiled_and_vec():
+    # vec needs ws8192, tiled needs ws4096; only 100 available -> only naive
+    req = _krequest(64, 64, 64, 16, 100)
+    assert kernel_decide(req)["kernel_id"] == "naive"
 
 
 def _run_all():
