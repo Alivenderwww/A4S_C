@@ -67,8 +67,14 @@ struct Options {
     const_prop = dce = cse = o2;
     licm = mem_coalesce = o2;
     dual_issue = o2;
-    unroll = (level == OptLevel::O3);  // aggressive: opt-in at -O3 only.
-    sched_window = (level == OptLevel::O3) ? 32 : 16;
+    // Unrolling is now a DEFAULT (-O2) optimization: it is shape-conservative
+    // (only constant-trip single-block self-loops) and guarded against register
+    // pressure (see unroll.cpp), so it is correctness-safe on every kernel while
+    // giving large latency-hiding wins (e.g. reuse 2308->820). -O3 pushes a
+    // more aggressive unroll factor + wider scheduling window.
+    unroll = o2;
+    unroll_factor = (level == OptLevel::O3) ? 8 : 4;
+    sched_window  = (level == OptLevel::O3) ? 32 : 16;
   }
 };
 

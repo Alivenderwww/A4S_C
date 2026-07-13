@@ -29,15 +29,20 @@ C1 = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(C1, "sim"))
 
 # Candidate configurations to sweep (all flags are supported by aec-cc).
+# The dominant knob is the unroll factor: its optimum is kernel-dependent
+# (reuse wants full unroll U16 -> 448c, poly wants U4 -> 784c; over-unrolling
+# poly to U16 regresses to 816c), which is exactly what makes the agent useful.
+# sched_window was measured to be inert on these kernels (win16==win32==win64),
+# so it is not swept.
 CONFIGS = [
-    ("O0",          ["-O0"]),
-    ("O2",          ["-O2"]),
-    ("O3",          ["-O3"]),
-    ("O2-no-sched", ["-O2", "--no-dual-issue"]),
-    ("O2-no-licm",  ["-O2", "--no-licm"]),
-    ("O3-win32",    ["-O3", "--sched-window", "32"]),
+    ("O0",         ["-O0"]),
+    ("O2",         ["-O2"]),                            # default: unroll U4
+    ("O3",         ["-O3"]),                            # aggressive: unroll U8
+    ("O3-u16",     ["-O3", "--unroll-factor", "16"]),   # full unroll (reuse floor)
+    ("O3-u4",      ["-O3", "--unroll-factor", "4"]),    # lighter (poly-friendly)
+    ("O2-no-licm", ["-O2", "--no-licm"]),               # ablation lever
 ]
-DEFAULT_CONFIG = "O0"     # un-tuned baseline; agent should beat it.
+DEFAULT_CONFIG = "O2"     # the compiler default (-O2); the agent tunes UP from it.
 
 
 def tool(name):

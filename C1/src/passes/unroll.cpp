@@ -100,6 +100,18 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
           !carried.count(b.insts[i].dst.value))
         steadyDefs.insert(b.insts[i].dst.value);
 
+    // Register-pressure guard (CORRECTNESS, not just perf). Each copy gets its
+    // own fresh temporaries, and the scheduler deliberately keeps them live at
+    // once to overlap load latency, so peak live registers grow ~U x the body's
+    // temps. Our spiller is a STUB (a real spill would clobber), so REFUSE to
+    // unroll whenever the estimate would exceed a safe fraction of the register
+    // file -- skipping only forfeits the speedup, unrolling into a spill would
+    // be WRONG. This is what makes unroll safe at -O2 (the default level,
+    // applied to every kernel incl. register-pressure mutations).
+    const size_t estRegs =
+        carried.size() + steadyDefs.size() * (size_t)U + 2u * (size_t)(U - 1);
+    if (estRegs > (size_t)(kRegisterCount * 3 / 4)) continue;   // ~192 of 256
+
     // --- build the unrolled instruction list -----------------------------
     std::vector<ir::Inst> out;
     for (int c = 0; c < U; ++c) {
