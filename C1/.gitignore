@@ -9,8 +9,9 @@
 /sim/build/
 __pycache__/
 
-# Submission entry points are (re)built from bin/ by `make submit`.
-/compiler/
+# The submission-entry wrapper compiler/aec-cc is TRACKED (a committed script,
+# not a build product); only the Windows test copy and the disassembler are not.
+/compiler/*.exe
 /disassembler/
 
 /.venv

@@ -35,12 +35,18 @@ all: build submit
 build: $(CC_BIN) $(OD_BIN)
 	@echo "built with -std=$(CXXSTD): $(CC_BIN) $(OD_BIN)"
 
-# Place the required submission entry point (spec §14) at the path the grader
-# invokes: compiler/aec-cc. disassembler/aec-objdump is our companion tool.
+# The submission entry point (spec §14) is compiler/aec-cc, a committed wrapper
+# that build-on-first-use + execs bin/aec-cc, so it works with or without a
+# grader pre-build. On Windows we also drop a native .exe next to it for local
+# testing; on Linux we just keep the wrapper executable (never overwrite it).
 submit: build
 	@mkdir -p compiler disassembler
-	@cp $(CC_BIN) compiler/aec-cc$(EXE)
 	@cp $(OD_BIN) disassembler/aec-objdump$(EXE)
+ifeq ($(OS),Windows_NT)
+	@cp $(CC_BIN) compiler/aec-cc.exe
+else
+	@chmod +x compiler/aec-cc
+endif
 	@echo "submission entry points ready: compiler/aec-cc  disassembler/aec-objdump"
 
 $(CC_BIN): $(LIB_OBJ) $(CC_OBJ)

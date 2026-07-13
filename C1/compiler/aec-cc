@@ -1,0 +1,15 @@
+#!/bin/sh
+# C1 submission entry point (spec §14): compiler/aec-cc.
+#
+# This is a committed wrapper, not a prebuilt binary — a compiler executable is
+# platform-specific and must be built on the grading machine (ARM Linux, GCC
+# 13.3). The wrapper builds the native compiler on first use and then runs it,
+# so `compiler/aec-cc kernel.ptx -O2 -o out.aecbin --report report.json` works
+# whether or not the grader pre-builds the project.
+set -e
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+bin="$root/bin/aec-cc"
+if [ ! -x "$bin" ]; then
+    make -s -C "$root" build 1>&2
+fi
+exec "$bin" "$@"

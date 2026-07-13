@@ -80,9 +80,10 @@ make clean      # 清理 obj/ bin/
 - 不使用 C++14/17 库特性（`std::optional`/`std::filesystem`/结构化绑定/`make_unique`），
   也不使用 C++17 移除的特性（`register`/`std::auto_ptr`/`std::random_shuffle`/动态异常规格）。
 - `-finput-charset=UTF-8` 保证源码里的 UTF-8 中文注释跨 locale 可移植。
-- **构建入口**：`make` 用了 POSIX recipe（`mkdir -p`/`rm -rf`），在 Linux/WSL/Git Bash 下
-  执行。Linux 下产物为 `compiler/aec-cc`（无 `.exe` 后缀），即评测调用的入口；MinGW 下带
-  `.exe`，Makefile 用 `$(EXE)` 统一处理。
+- **提交入口 `compiler/aec-cc`**：是一个**入库的 wrapper 脚本**（不是预编译二进制——编译器
+  平台相关，必须在评测机上 build）。它首次调用时自动 `make build` 出 native `bin/aec-cc` 再
+  exec，因此无论评测机是否预先构建，`compiler/aec-cc kernel.ptx -O2 -o out --report r.json`
+  都能直接工作。本机（MinGW）另在 `compiler/aec-cc.exe` 放一份 native 供本地测试。
 - **提交前建议**：在一台带 GCC 的 Linux 机器上跑一次 `make build submit`，确认评测环境能
   从源码构建出 `compiler/aec-cc`（本开发机 g++ 4.9.2 只能验证 c++11 编译，未在 GCC 13/ARM 上实测）。
 
