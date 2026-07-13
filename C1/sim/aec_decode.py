@@ -56,7 +56,7 @@ _IMM_OPS = {"LOADI", "LOADI64", "BR", "BRX", "CALL", "SSYNC", "RDPMC"}
 
 
 def uses_immediate(op, space):
-    return op in _IMM_OPS or (op == "LD" and space == 4)  # LD.pmem
+    return op in _IMM_OPS
 
 
 class Instr:
@@ -135,38 +135,17 @@ class Image:
 
 
 def load_aecbin(path):
+    # C1 spec §10: raw 128-bit instruction stream, no header. File size is a
+    # non-zero multiple of 16 bytes; entry_pc is 0.
     with open(path, "rb") as f:
         b = f.read()
-    if len(b) < 32:
-        raise ValueError("file smaller than header")
-    magic, version, hdr_bytes, sec_count, entry, icount, pbytes, flags = \
-        struct.unpack_from("<8I", b, 0)
-    if magic != 0x31434541:
-        raise ValueError("bad magic 0x%08x (not .aecbin)" % magic)
+    if not b or len(b) % 16 != 0:
+        raise ValueError("file size %d is not a non-zero multiple of 16" % len(b))
     img = Image()
-    img.entry_pc, img.instr_count, img.param_bytes = entry, icount, pbytes
-    table = hdr_bytes or 32
-    for s in range(sec_count):
-        typ, off, size, ent = struct.unpack_from("<4I", b, table + s * 16)
-        if typ == 1:  # CODE
-            for i in range(size // 16):
-                words = struct.unpack_from("<4I", b, off + i * 16)
-                img.code.append(Instr(words))
-        elif typ == 2:  # DATA
-            img.data = b[off:off + size]
-        elif typ == 3 and size >= 4:  # RELOC
-            (n,) = struct.unpack_from("<I", b, off)
-            for i in range(n):
-                ii, kind, add, _ = struct.unpack_from("<4I", b, off + 4 + i * 16)
-                img.relocs.append((ii, kind, add))
-        elif typ == 4 and size >= 4:  # SYMBOL
-            (n,) = struct.unpack_from("<I", b, off)
-            p = off + 4
-            for i in range(n):
-                (nl,) = struct.unpack_from("<I", b, p); p += 4
-                name = b[p:p + nl].decode("latin1"); p += nl
-                val, kind = struct.unpack_from("<2I", b, p); p += 8
-                img.symbols.append((name, val, kind))
+    img.instr_count = len(b) // 16
+    img.entry_pc = 0
+    for i in range(img.instr_count):
+        img.code.append(Instr(struct.unpack_from("<4I", b, i * 16)))
     return img
 
 

@@ -340,12 +340,8 @@ class Sim:
             if ty not in ("b32", "b64", "u32", "s32", "f32"):
                 raise ExecError("illegal LD type '.%s' (Track-B §4.1)" % ty)
             width = 8 if ty == "b64" else 4
-            if ins.space == 4:  # pmem, addr = imm offset (uniform)
-                addr = np.full(W, ins.imm, np.uint32)
-                mem = self.pmem
-            else:
-                addr = R[:, s1]
-                mem = {0: self.gmem, 1: smem, 3: lmem}.get(ins.space, self.gmem)
+            addr = R[:, s1]          # byte address/offset in a register (all spaces)
+            mem = {0: self.gmem, 1: smem, 3: lmem, 4: self.pmem}.get(ins.space, self.gmem)
             lo = self._load(mem, addr, 4, em)
             wr_u32(d, lo)
             if width == 8:
