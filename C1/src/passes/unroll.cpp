@@ -11,8 +11,11 @@
 //
 // Scope (conservative, verified by the sim oracle): one single-block self-loop
 // of the exact shape `...body...; counter += step; setp.lt P,counter,bound;
-// @P bra self`, with `step` and `bound` compile-time constants and the trip
-// count bound/step divisible by U. Opt-in at -O3 only (keeps -O2 untouched).
+// @P bra self`, with `step` a compile-time constant. `bound` may be a RUNTIME
+// value (e.g. GEMM's K param): when the trip is not a known multiple of U, the
+// last group's out-of-range copies (iv_c >= bound) are predicated off with a
+// fresh predicate p_c = G && (iv_c < bound) so no out-of-range load or
+// accumulator update happens. On at -O2. GEMM K-loop 5240->2168 (-59%).
 #include "aec/passes.h"
 
 #include <map>
@@ -56,6 +59,16 @@ void renameOperand(ir::Operand &o, const std::map<uint32_t, uint32_t> &m) {
   if (it != m.end()) o.value = it->second;
 }
 
+bool isMemOp(ir::Op op) {
+  switch (op) {
+    case ir::Op::LD: case ir::Op::ST: case ir::Op::LDC: case ir::Op::ATOM:
+    case ir::Op::TLDA: case ir::Op::TSTA: case ir::Op::TMOV:
+      return true;
+    default:
+      return false;
+  }
+}
+
 } // namespace
 
 bool unrollLoops(ir::Function &fn, const Options &opt) {
@@ -84,10 +97,18 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     if (add.s1.kind != ir::Operand::Reg || add.s1.value != add.dst.value) continue;
 
     const uint32_t counter = add.dst.value;
-    uint32_t step = 0, bound = 0;
+    uint32_t step = 0;
     if (add.s2.kind != ir::Operand::Reg || !constOf(fn, add.s2.value, step)) continue;
-    if (cmp.s2.kind != ir::Operand::Reg || !constOf(fn, cmp.s2.value, bound)) continue;
-    if (step == 0 || bound == 0 || (bound % (step * (uint32_t)U)) != 0) continue;
+    if (step == 0) continue;
+    if (cmp.s2.kind != ir::Operand::Reg) continue;
+    const uint32_t boundReg = cmp.s2.value;
+
+    // A constant trip that U divides needs no remainder. Otherwise (a runtime
+    // bound like GEMM's K param, or a non-multiple constant) the last group has
+    // fewer than U valid iterations, so copies past `bound` are predicated off.
+    uint32_t boundConst = 0;
+    const bool divisible = constOf(fn, boundReg, boundConst) && boundConst != 0 &&
+                           (boundConst % (step * (uint32_t)U)) == 0;
 
     // Loop-carried set (kept shared across copies); the counter is shifted.
     std::set<uint32_t> carried;
@@ -112,6 +133,43 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
         carried.size() + steadyDefs.size() * (size_t)U + 2u * (size_t)(U - 1);
     if (estRegs > (size_t)(kRegisterCount * 3 / 4)) continue;   // ~192 of 256
 
+    // Remainder predication for a non-divisible trip: copies c>=1 whose induction
+    // value iv_c >= bound must skip their memory ops (out-of-range read) and
+    // loop-carried writes (accumulator corruption). Each gets a fresh predicate
+    // p_c = G && (iv_c < bound), where G is the body's (loop-invariant) memory
+    // guard; predicates start false and G is invariant, so guarding the p_c
+    // compare by G gives exactly that AND. Bail (skip unroll, always safe) if the
+    // body's memory ops don't share one loop-invariant guard, or predicates run
+    // out.
+    int bodyGuard = -2;                 // -2 unset, -1 none, >=0 predicate id
+    std::vector<int> remPred;
+    if (!divisible) {
+      for (int i = 0; i < n - 3; ++i) {
+        if (!isMemOp(b.insts[i].op)) continue;
+        int g = b.insts[i].guard;
+        if (bodyGuard == -2) bodyGuard = g;
+        else if (bodyGuard != g) { bodyGuard = -3; break; }
+      }
+      if (bodyGuard == -3) continue;    // mixed memory guards
+      if (bodyGuard == -2) bodyGuard = -1;
+      bool guardInvariant = true;       // G must not be written inside the loop
+      if (bodyGuard >= 0)
+        for (int i = 0; i < n - 3; ++i)
+          if (b.insts[i].dst.kind == ir::Operand::Pred &&
+              (int)(b.insts[i].dst.value & 7) == bodyGuard) guardInvariant = false;
+      if (!guardInvariant) continue;
+      std::set<int> used;
+      for (unsigned bb = 0; bb < fn.blocks.size(); ++bb)
+        for (unsigned i = 0; i < fn.blocks[bb].insts.size(); ++i) {
+          const ir::Inst &in = fn.blocks[bb].insts[i];
+          if (in.guard >= 0) used.insert(in.guard & 7);
+          if (in.dst.kind == ir::Operand::Pred) used.insert((int)(in.dst.value & 7));
+        }
+      for (int p = 0; p < 8 && (int)remPred.size() < U - 1; ++p)
+        if (!used.count(p)) remPred.push_back(p);
+      if ((int)remPred.size() < U - 1) continue;   // not enough free predicates
+    }
+
     // --- build the unrolled instruction list -----------------------------
     std::vector<ir::Inst> out;
     for (int c = 0; c < U; ++c) {
@@ -120,9 +178,8 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
            it != steadyDefs.end(); ++it)
         ren[*it] = fn.regs.nextVReg++;                 // fresh temp per copy.
 
-      if (c == 0) {
-        // copy 0 uses the counter directly.
-      } else {
+      int pc = -1;
+      if (c > 0) {
         uint32_t cimm = fn.regs.nextVReg++;            // LOADI c*step
         uint32_t ivc  = fn.regs.nextVReg++;            // iv_c = counter + c*step
         ren[counter] = ivc;
@@ -133,13 +190,25 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
         ad.dst = ir::Operand::reg(ivc);
         ad.s1 = ir::Operand::reg(counter); ad.s2 = ir::Operand::reg(cimm);
         out.push_back(ad);
+        if (!divisible) {
+          pc = remPred[c - 1];                         // p_c = G && (iv_c < bound)
+          ir::Inst cp = cmp;                           // same CMPP.lt.<type>, s2=bound
+          cp.dst = ir::Operand::pred((uint32_t)pc);
+          cp.s1 = ir::Operand::reg(ivc);
+          cp.guard = bodyGuard;
+          out.push_back(cp);
+        }
       }
       for (int i = 0; i < n - 3; ++i) {
         ir::Inst in = b.insts[i];
+        const bool carriedWrite = in.dst.kind == ir::Operand::Reg &&
+                                  carried.count(in.dst.value) != 0;
         renameOperand(in.dst, ren);
         renameOperand(in.s1, ren);
         renameOperand(in.s2, ren);
         renameOperand(in.s3, ren);
+        if (pc >= 0 && (isMemOp(in.op) || carriedWrite))
+          in.guard = pc;                               // off past bound
         out.push_back(in);
       }
     }
