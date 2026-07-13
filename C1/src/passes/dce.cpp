@@ -1,7 +1,10 @@
 // dce.cpp - Dead code elimination.  Scoring category: T2.
 //
-// STATUS: wired identity stub. The scaffolding computes a use-count over
-// virtual registers (what a real DCE consults) but performs no removal yet.
+// Counts uses of every virtual register across the function and drops any
+// instruction whose register result is never used and has no side effect,
+// iterating to a fixpoint (removing a dead def can make its sources dead).
+// Loads/stores/barriers are kept regardless (a load may fault). This also
+// cleans up the definitions that CSE/const-prop leave unreferenced.
 #include "aec/passes.h"
 
 #include <map>

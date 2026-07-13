@@ -1,11 +1,10 @@
-// licm.cpp - Loop-invariant code motion.  Scoring category: T2.
+// licm.cpp - Loop-invariant code motion.  Scoring categories: T2 + T3.
 //
-// STATUS: wired identity stub. Detects natural loops from the CFG back-edges
-// (a real LICM's prerequisite) but hoists nothing yet.
-//
-// A T2 (scalar optimization) kernel that computes a loop-invariant expression
-// inside its K-loop is the hoist target: values that don't depend on the loop
-// counter can move to the preheader.
+// Detects natural loops from CFG back-edges and hoists loop-invariant pure
+// instructions into the loop's (fall-through) entry predecessor. In a store-free
+// loop it also hoists loop-invariant LD/LDC -- redundant-load elimination for
+// values that don't change across iterations (T3). Values that don't depend on
+// the loop counter move to the preheader and run once instead of every trip.
 #include "aec/passes.h"
 
 #include <map>
