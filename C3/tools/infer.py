@@ -183,7 +183,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     inputs, n = _load_inputs(args.input)
-    backend = _make_backend(args.onnx, backend_name=args.backend)
+    backend = _make_backend(onnx_path=args.onnx, backend_name=args.backend)
 
     bs = args.batch_size if args.batch_size and args.batch_size > 0 else n
     bs = max(1, bs)
