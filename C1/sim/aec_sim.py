@@ -10,17 +10,18 @@ Faithful to the AEC model where it matters for these kernels:
   * 256 u32 GPR + 8 predicates per lane; GPR/pred init 0.
   * `BRX` requires a UNIFORM condition across active lanes — a divergent branch
     (e.g. an un-predicated `if (tid>=n) return;` on a partial block) raises an
-    ExecError, exactly as the real ISA would. This is what catches the
-    "must if-convert the bounds guard" bug (see C1_实现流程分析.md §1.3).
+    ExecError, matching Track-B §A.2 (non-uniform BRX is an execution error).
+    This is what catches the "must if-convert the bounds guard" bug
+    (see C1_实现流程分析.md §1.3).
 
 Deliberate simplifications (documented so results are not over-trusted):
   * No cross-thread interaction is modelled beyond shared GMEM (these public
     kernels use no smem/atomics/barriers). smem is per-CTA zeroed; lmem per-lane.
   * FP is IEEE via numpy; FMA is single-rounded (float64 intermediate), MAD is
     two-rounded — so a wrong `mad.f32→MAD` mapping shows up as a mismatch.
-  * Integer ADD/SUB/MUL are 32-bit wraparound for ANY integer/bit type
-    (u32/s32/b32/b64), so current scaffold pointer math (`ADD.b64`) still runs;
-    pass strict=True to flag types the real ISA rejects.
+  * Integer ADD/SUB/MUL wrap at 32 bits for any integer/bit type. LD/ST widths
+    follow the Track-B §4.1 legal-type matrix (an illegal 64-bit store is an
+    ExecError); `strict=True` additionally flags questionable arithmetic types.
 
 This oracle validates that the compiler emits the INTENDED computation and legal
 control flow; it is not a bit-exact stand-in for the hidden golden model.
