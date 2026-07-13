@@ -26,7 +26,7 @@ using namespace aec;
 static void usage(const char *argv0) {
   std::printf(
     "usage: %s input.ptx [-O0|-O2|-O3] [-o out.aecbin] [--report r.json]\n"
-    "          [--no-const-prop|--no-dce|--no-cse|--no-licm\n"
+    "          [--no-const-prop|--no-dce|--no-cse|--no-licm|--no-mad-contract\n"
     "           |--no-pred-opt|--no-dual-issue] [--sched-window N]\n"
     "          [--selftest] [-v|--verbose] [-h|--help]\n", argv0);
 }
@@ -82,6 +82,7 @@ int main(int argc, char **argv) {
     else if (a == "--no-dce") { opt.dce = false; }
     else if (a == "--no-cse") { opt.cse = false; }
     else if (a == "--no-licm") { opt.licm = false; }
+    else if (a == "--no-mad-contract") { opt.mad_contract = false; }
     else if (a == "--no-pred-opt") { opt.pred_opt = false; }
     else if (a == "--no-dual-issue") { opt.dual_issue = false; }
     else if (a == "--unroll") { opt.unroll = true; }
