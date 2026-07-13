@@ -98,8 +98,8 @@
 ## 4. 待向组委会确认的问题
 1. C3.2/C3.3 的 `bench_c32_c33.py` 及其 import 的 scheduler 框架，eval 时是否提供？还是选手按 API 契约自建同名包？
 2. C3.5 分值口径：显存 10 还是 15？精度门槛是否计入 15 分？
-3. C1 是否会提供 golden/cycle model 用于选手自测，还是只在评测端？
-4. 跨赛道 ISA：C1 需要的 TMUL 等指令，编码是否完全等同 `b_isa_public.json` 定义？
+3. C1 是否会提供专用 golden/cycle model？（Track-B `aec_cases` 的 `program.bin`+`expected/gmem` 已可作执行 golden 自测。）
+4. C1 编码已定 = **Track-B §A.1**（非 C2 `b_isa_public.json`），用 `Track-B/testcases/tests/aec_cases` 反解 + 执行验证。TMUL 存在于 golden（0x60）但 §A.1 表未列、tile 语义本地不可验。
 
 ---
 

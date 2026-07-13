@@ -208,8 +208,9 @@ TMUL mode：`f32=0 f16=1 bf16=2 s8=3 s4=4 f8e4m3=5 f4e2m1=6`，mode 7 扩展 `f6
 | `ST.gmem.type [Ra],Rs` | Dest=0，Src1=地址，Src2=源 |
 | `TLDA/TMUL/TSTA`       | tensor tile，精度 mode 在 [10:8] |
 
-> golden 验证：`src/isa/encoder.cpp::selfTest()` 内置 8 条向量，与
-> `public/.../golden/b_isa_public.json` 逐位一致，可用 `bin/aec-cc --selftest` 运行。
+> golden 验证：`src/isa/encoder.cpp::selfTest()` 内置 8 条向量，取自
+> `Track-B/testcases/tests/aec_cases/cvtff/program.bin`（Track-B §A.1 编码），
+> 逐位一致，可用 `bin/aec-cc --selftest` 运行。
 
 ---
 
@@ -276,8 +277,8 @@ TMUL mode：`f32=0 f16=1 bf16=2 s8=3 s4=4 f8e4m3=5 f4e2m1=6`，mode 7 扩展 `f6
 
 ## 9. 风险提示
 
-- **无 golden model / cycle model**：C1 未随包提供参考执行模型与周期模型。因此：
-  - 只能用 `b_isa_public.json` 对**编码**做逐位自检（已通过），**无法**本地验证执行语义正确性；
+- **无独立 golden model / cycle model**：C1 未随包提供专用参考执行/周期模型。但：
+  - Track-B `testcases/tests/aec_cases/` 提供 36 个 `program.bin` + 35 个 `expected/gmem` 执行 golden，既验编码又验执行语义（12/12 自包含用例逐字节一致）；
   - Agent 的 `est_cycles` 是编译器自带的**启发式估算**（`driver.cpp::estimateCycles`），
     不是官方周期数。真实周期模型可用后，应替换 `agent/run_agent.py::read_cycles` 的来源。
 - **仅覆盖真实 PTX 子集**：解析器按公开用例（真实 NVIDIA PTX：`.version 7.0`/`sm_70`/
