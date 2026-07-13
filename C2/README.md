@@ -60,3 +60,38 @@ make public-cases
 `RELEASE_MANIFEST.json` 记录本资料包的 ABI/ISA 版本和文件哈希。若资料包内文件与赛事官网
 勘误冲突，以官网最新正式勘误为准；没有正式勘误时，不自行推断或修改公共契约，应向主办方
 提交问题。
+
+## 自定义 hidden-style 测试
+
+无需第三方依赖的测试入口：
+
+```bash
+cd C2
+python3 -B tests/run_hidden_style.py
+```
+
+自动发现并执行 `tests/test_*.py` 中的 `test_*` 函数，打印每项 `PASS`/`FAIL` 和汇总。
+未构建 `libaec.so` 时相关测试自动 SKIP。
+
+### 契约边界测试
+
+参见 [`tests/test_runtime_contract.py`](tests/test_runtime_contract.py)：
+R101–R106、R201–R204、R301–R304 的契约边界，包括子进程隔离的危险指针测试。
+
+### NaN 输出位型探测
+
+参见 [`tests/test_official_contradictions.py`](tests/test_official_contradictions.py)：
+探测设备对 NaN 输入的位型输出，结果打印到 stdout（不被 runner 捕获）并同时写入
+`tests/nan_report.json`。该探测**不是 Runtime 门禁**——非 canonical NaN 作为
+`UPSTREAM-MISMATCH` 报告，不阻断测试套件。
+
+### GEMM OOB 与 Vector 契约
+
+`tests/test_official_contradictions.py` 同时包含对隐藏评分规则等价性的验证：
+- 所有 GEMM dtype 下 undersized C → `ISA_TRAP`（R203 泛化）
+- AXPY/DOT/NRM2 one-past count → `INVALID_ARGUMENT`（R204，不是 `ISA_TRAP`）
+
+## 完成度审计与测试矩阵
+
+参见 [`docs/C2-完成度审计与测试矩阵.md`](../docs/C2-完成度审计与测试矩阵.md)：远端公开评分
+88/100 基线、R101–R402 矩阵、官方回复、测试覆盖描述。

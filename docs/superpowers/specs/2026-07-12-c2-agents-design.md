@@ -175,3 +175,27 @@ out = {"kernel_id": best["id"]}
 - **DMA 公式**：是 grader 内联实现的确定函数，`_dma_cycles` 已逐字段对照，无误。
 - **Agent 协议违规**：必须严格只输出规定键、无 stderr 日志、<1s。实现时注意 `json.load(sys.stdin)`
   读全部输入、`json.dump(..., sys.stdout)` 单次写出、不 print 调试信息。
+
+---
+
+## 10. 组委会澄清与 public/ 审计（2026-07-13）
+
+### 10.1 组委会 Q&A 澄清（官方渠道）
+
+1. **不需要实现或调用真正的 cuBLAS**（只是类似 cuBLAS）。我们的 `aecMatmul*` 就是那层，无影响。
+2. **C2 不只是调度启动 image，要完成完整的 runtime 和 driver 行为**——stream/event/双 DMA/注册内存/故障恢复都必须是真实现（不能 stub/简化），官方 full 会测。
+3. **不需要修改 image，不需要修改设备算子**——设备/image 是黑盒契约。
+4. **34 个 image 也是正式使用的计算 image**（不只是公开测试用例）——official full 用同一批 image + 同一确定性设备。
+
+### 10.2 对核查权重的影响
+
+- **风险 A（driver 完整性）权重↑**：组委会强调"完整 driver 行为"，`aec_runtime.cpp` 的同步 stream 简化（不提交 BARRIER、EventQuery 永不 NOT_READY）、无 alloc 影子表（bounds/double-free 全靠设备）是核查首要目标。该核查随后由提交 `kzwywwpm "test(c2): harden runtime against hidden cases"` 落地（加固 runtime + 并发测试架 + 审计报告）。
+- **风险 B（kernel agent 隐藏泛化）权重↓**：同 34 image + 同设备 → 周期模型确定，§5.4 探针结论（`vec<tiled<naive`）对 official 同样成立；只需扩大探针覆盖更多 shape/dtype 确认全局单调。
+
+### 10.3 public/ 审计结果（2026-07-13 全量哈希比对）
+
+public/Track-C/C2-runtime 于 07-13 11:42 重新落盘：
+
+- ✅ grader、3 个头文件、libaec_device.so、kernels/manifest、docs/01-06、schemas、examples、cases、tutorial、RELEASE_MANIFEST ——**全部 SAME**
+- 仅 README.md 因 c2/ 为定制提交包而不同（不影响评分）
+- **契约与文档零实质变更**，本设计的 88/Good + public_diagnostic=1.0 基线完全有效。
