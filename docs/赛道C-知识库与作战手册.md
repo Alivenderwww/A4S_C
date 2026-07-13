@@ -23,11 +23,12 @@
 
 对比过 spec 描述和仓库里真正 ship 的文件，三题"起点"差异极大：
 
-### C1 —— 从零自建，且**没有本地正确性验证**
+### C1 —— 从零自建，正确性验证依赖自建 oracle
 - ✅ 给了：5 个公开 `.ptx`、ISA 文档（`docs/03`＋`Track-B/spec.md`）、ISA 编码金标准向量 `starter-kit/golden/b_isa_public.json`
-- ❌ 没给：**golden model、cycle model、参考 aec-cc**。只能验证指令**编码格式**，验证不了**执行结果**
-- ❗ 输入是**真实 NVIDIA PTX**（`.version 7.0 / .target sm_70 / %tid.x / mad.lo.u32 / st.global`），不是 spec.md 示例里的简化 `aec_sm_10`/`.gmem`
-- 自建量最大：PTX 解析 → CFG/SSA → 优化 pass → 寄存器分配 → 调度 → TMUL/GEMM lowering → 二进制生成 → `aec-objdump` → Agent
+- ✅ 设计目标：自建本地 oracle（`C1/sim/`：AEC 功能模拟器 + numpy 参考对拍），填补正确性验证缺口
+- ❌ 没给：**golden model、cycle model、参考 aec-cc**
+- ❗ 输入是**真实 NVIDIA PTX**（非 spec.md 示例简化语法）
+- 当前状态见 [`docs/C1-完成度审计.md`](../docs/C1-完成度审计.md)（工程状态唯一事实源，本文不再重复枚举）
 
 ### C2 —— 高度脚手架化，**本地可自测打分（最高性价比）**
 - ✅ 给了：`lib/libaec_device.so`（真正算数的受控设备）、全套头文件、`src/aec_runtime.cpp`（**只实现了设备查询+错误处理，其余全 `return AEC_ERROR_NOT_SUPPORTED`**）、评分脚本 `grader/public_grade.py`、公开测试 `cases/test_r101~r402.py`
@@ -87,11 +88,11 @@
 
 | | C2（C++，稳分优先） | C3（Python，分最多） | C1（C++，最难先起手） |
 |--|--|--|--|
-| **Day1** | R101–R106 全过（内存/拷贝/stream/event/launch）→ 30 分到手 | `onnx` 出 C3.1 DAG JSON；PyTorch/CuPy 跑通 MLP 过门禁 | PTX 解析 + T1 lowering：vadd 编出合法 aecbin + objdump |
-| **Day2** | GEMM 10 dtype + AXPY/DOT/NRM2 + 双DMA/注册内存/故障恢复 → 冲 Good | 打通 ResNet-18 + Transformer 全过门禁（60分）；搭 `scheduler` 框架 API | T2/T3（DCE/CSE/LICM+内存合并）+ 线性扫描寄存器分配 |
-| **Day3** | 两个 Agent（DMA+kernel 选镜像）冲 Excellent + 全量 grader | C3.2/3.3 五融合模式 + C3.4 内存规划（要经得起 code review）+ 时间/显存调优 | T4 调度 + **T5 TMUL/GEMM lowering（权重16最高）** + Agent 闭环 |
+| **Day1** | R101–R106 全过（内存/拷贝/stream/event/launch）→ 30 分到手 | `onnx` 出 C3.1 DAG JSON；PyTorch/CuPy 跑通 MLP 过门禁 | 前端解析 + 基础 lowering（历史赛题需求；当前状态见 [`docs/C1-完成度审计.md`](../docs/C1-完成度审计.md)） |
+| **Day2** | GEMM 10 dtype + AXPY/DOT/NRM2 + 双DMA/注册内存/故障恢复 → 冲 Good | 打通 ResNet-18 + Transformer 全过门禁（60分）；搭 `scheduler` 框架 API | 标量优化 + 寄存器分配（历史赛题需求；当前状态见 [`docs/C1-完成度审计.md`](../docs/C1-完成度审计.md)） |
+| **Day3** | 两个 Agent（DMA+kernel 选镜像）冲 Excellent + 全量 grader | C3.2/3.3 五融合模式 + C3.4 内存规划（要经得起 code review）+ 时间/显存调优 | 指令调度 + GEMM lowering + Agent（历史赛题需求；当前状态见 [`docs/C1-完成度审计.md`](../docs/C1-完成度审计.md)） |
 
-人手不足时优先级：**C2 全量 > C3.1+C3.5(60) > C1 正确性 > C3.2/3.3/3.4 > C1 性能/Agent**。
+人手不足时优先级：**C2 全量 > C3.1+C3.5(60) > C3.2/3.3/3.4**。C1 优先级及计划见 [`docs/C1-完成度审计.md`](../docs/C1-完成度审计.md)。
 
 ---
 
