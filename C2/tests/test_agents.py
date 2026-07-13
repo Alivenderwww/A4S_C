@@ -121,7 +121,7 @@ def test_kernel_workspace_filters_tiled_and_vec():
 
 
 def _run_all():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    tests = [globals()[k] for k in sorted(k for k in globals() if k.startswith("test_"))]
     for t in tests:
         t()
         print("PASS", t.__name__)

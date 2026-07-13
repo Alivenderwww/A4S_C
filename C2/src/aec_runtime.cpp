@@ -39,6 +39,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <unordered_map>
@@ -88,6 +89,7 @@ struct HostInterval {
 };
 
 std::mutex g_mutex; // guards the registries and the registration table below.
+std::recursive_mutex g_submit_mutex; // linearizes submit: sequence alloc + device call atomic.
 std::unordered_set<aecStream_t> g_streams;
 std::unordered_set<aecEvent_t> g_events;
 std::vector<HostInterval> g_registrations;
@@ -116,6 +118,13 @@ struct aecEventOpaque {
     bool recorded;
     uint64_t cycles_snapshot; // Stream cycle count captured at record time
 };
+
+// Retired handles prevent address reuse: destroyed objects stay alive (owned
+// by these containers) until process exit, so their pointer values can never
+// collide with a newly created live handle.  Bounded lifetime — allocated
+// memory is reclaimed by the OS on exit.
+static std::vector<std::unique_ptr<aecStreamOpaque>> g_retired_streams;
+static std::vector<std::unique_ptr<aecEventOpaque>> g_retired_events;
 
 namespace {
 
@@ -168,9 +177,16 @@ struct ParamBlock {
 // (execution faults / ISA traps) -- docs/02 section 8.
 aecError_t submit_command(aecDeviceCommand &command, uint64_t *out_cycles) {
     command.abi_version = AEC_DEVICE_ABI_VERSION;
-    command.sequence = g_sequence.fetch_add(1, std::memory_order_relaxed);
     aecDeviceCompletion completion{};
-    const aecDeviceStatus rc = aecDeviceSubmit(&command, &completion);
+    aecDeviceStatus rc;
+    {
+        // Linearize: allocate sequence AND submit atomically so the device
+        // observes commands in strict monotonic order (fixes same-stream
+        // concurrent stress red).
+        std::lock_guard<std::recursive_mutex> lock(g_submit_mutex);
+        command.sequence = g_sequence.fetch_add(1, std::memory_order_relaxed);
+        rc = aecDeviceSubmit(&command, &completion);
+    }
     if (out_cycles) *out_cycles = completion.virtual_cycles;
     if (rc != AEC_DEVICE_SUCCESS) return from_device(rc);
     if (completion.status != AEC_DEVICE_SUCCESS) {
@@ -281,7 +297,8 @@ constexpr uint32_t kAxpyBlock = 256; // SPMD block width for vector kernels.
 aecError_t submit_gemm(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
                        uint32_t m, uint32_t n, uint32_t k, uint32_t dtype,
                        aecStream_t stream) {
-    if (m == 0 || n == 0 || k == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    if (m == 0 || n == 0 || k == 0 || m > 256 || n > 256 || k > 256)
+        return finish(AEC_ERROR_INVALID_ARGUMENT);
     ParamBlock params; // GEMM block = 40 bytes: A,B,C:u64, M,N,K,dtype:u32.
     params.put_u64(a);
     params.put_u64(b);
@@ -372,6 +389,7 @@ aecError_t aecAlloc(aecDevicePtr *out_ptr, size_t bytes) {
 }
 
 aecError_t aecFree(aecDevicePtr ptr) {
+    std::lock_guard<std::recursive_mutex> lock(g_submit_mutex);
     const aecDeviceStatus rc = aecDeviceFree(ptr);
     if (rc != AEC_DEVICE_SUCCESS) return finish(from_device(rc));
     {
@@ -385,6 +403,7 @@ aecError_t aecCopyH2D(aecDevicePtr dst, const void *src, size_t bytes) {
     if (src == nullptr) return finish(AEC_ERROR_INVALID_ARGUMENT);
     if (bytes == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
     const uint64_t host_address = reinterpret_cast<uint64_t>(src);
+    std::lock_guard<std::recursive_mutex> lock(g_submit_mutex);
     const uint16_t flags = host_span_registered(host_address, bytes)
                                ? (AEC_DEVICE_FLAG_REGISTERED | AEC_DEVICE_FLAG_ZERO_COPY)
                                : AEC_DEVICE_FLAG_NONE;
@@ -396,6 +415,7 @@ aecError_t aecCopyD2H(void *dst, aecDevicePtr src, size_t bytes) {
     if (dst == nullptr) return finish(AEC_ERROR_INVALID_ARGUMENT);
     if (bytes == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
     const uint64_t host_address = reinterpret_cast<uint64_t>(dst);
+    std::lock_guard<std::recursive_mutex> lock(g_submit_mutex);
     const uint16_t flags = host_span_registered(host_address, bytes)
                                ? (AEC_DEVICE_FLAG_REGISTERED | AEC_DEVICE_FLAG_ZERO_COPY)
                                : AEC_DEVICE_FLAG_NONE;
@@ -417,6 +437,7 @@ aecError_t aecCopyAsync(aecDevicePtr device_ptr, void *host_ptr, size_t bytes,
         return finish(AEC_ERROR_INVALID_ARGUMENT);
     }
     const uint64_t host_address = reinterpret_cast<uint64_t>(host_ptr);
+    std::lock_guard<std::recursive_mutex> lock(g_submit_mutex);
     const uint16_t flags = host_span_registered(host_address, bytes)
                                ? (AEC_DEVICE_FLAG_REGISTERED | AEC_DEVICE_FLAG_ZERO_COPY)
                                : AEC_DEVICE_FLAG_NONE;
@@ -451,16 +472,19 @@ aecError_t aecStreamCreate(aecStream_t *stream) {
 }
 
 aecError_t aecStreamDestroy(aecStream_t stream) {
-    std::unique_lock<std::mutex> guard(g_mutex);
+    std::lock_guard<std::recursive_mutex> submit_lock(g_submit_mutex);
+    std::lock_guard<std::mutex> guard(g_mutex);
     auto it = g_streams.find(stream);
     if (it == g_streams.end()) return finish(AEC_ERROR_INVALID_HANDLE);
-    g_streams.erase(it); // remove from the live registry first (docs/02 s.4)
-    guard.unlock();
-    delete stream;        // synchronous: no queue/worker left to drain.
+    g_streams.erase(it);
+    // Retire instead of delete: keep the object alive so its address can
+    // never be reused by a newly created live handle (ABA prevention).
+    g_retired_streams.push_back(std::unique_ptr<aecStreamOpaque>(stream));
     return AEC_SUCCESS;
 }
 
 aecError_t aecStreamSync(aecStream_t stream) {
+    std::lock_guard<std::recursive_mutex> submit_lock(g_submit_mutex);
     std::unique_lock<std::mutex> guard(g_mutex);
     if (g_streams.count(stream) == 0) return finish(AEC_ERROR_INVALID_HANDLE);
     const aecError_t pending = stream->pending;
@@ -485,16 +509,17 @@ aecError_t aecEventCreate(aecEvent_t *event) {
 }
 
 aecError_t aecEventDestroy(aecEvent_t event) {
-    std::unique_lock<std::mutex> guard(g_mutex);
+    std::lock_guard<std::recursive_mutex> submit_lock(g_submit_mutex);
+    std::lock_guard<std::mutex> guard(g_mutex);
     auto it = g_events.find(event);
     if (it == g_events.end()) return finish(AEC_ERROR_INVALID_HANDLE);
     g_events.erase(it);
-    guard.unlock();
-    delete event;
+    g_retired_events.push_back(std::unique_ptr<aecEventOpaque>(event));
     return AEC_SUCCESS;
 }
 
 aecError_t aecEventRecord(aecEvent_t event, aecStream_t stream) {
+    std::lock_guard<std::recursive_mutex> submit_lock(g_submit_mutex);
     std::lock_guard<std::mutex> guard(g_mutex);
     if (g_events.count(event) == 0) return finish(AEC_ERROR_INVALID_HANDLE);
     if (g_streams.count(stream) == 0) return finish(AEC_ERROR_INVALID_HANDLE);
@@ -506,6 +531,7 @@ aecError_t aecEventRecord(aecEvent_t event, aecStream_t stream) {
 }
 
 aecError_t aecEventSynchronize(aecEvent_t event) {
+    std::lock_guard<std::recursive_mutex> submit_lock(g_submit_mutex);
     std::lock_guard<std::mutex> guard(g_mutex);
     if (g_events.count(event) == 0) return finish(AEC_ERROR_INVALID_HANDLE);
     if (!event->recorded) return finish(AEC_ERROR_INVALID_ARGUMENT);
@@ -513,6 +539,7 @@ aecError_t aecEventSynchronize(aecEvent_t event) {
 }
 
 aecError_t aecEventQuery(aecEvent_t event) {
+    std::lock_guard<std::recursive_mutex> submit_lock(g_submit_mutex);
     std::lock_guard<std::mutex> guard(g_mutex);
     if (g_events.count(event) == 0) return finish(AEC_ERROR_INVALID_HANDLE);
     if (!event->recorded) return finish(AEC_ERROR_INVALID_ARGUMENT);
@@ -521,6 +548,7 @@ aecError_t aecEventQuery(aecEvent_t event) {
 
 aecError_t aecEventElapsedCycles(aecEvent_t start, aecEvent_t end, uint64_t *cycles) {
     if (cycles == nullptr) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    std::lock_guard<std::recursive_mutex> submit_lock(g_submit_mutex);
     std::lock_guard<std::mutex> guard(g_mutex);
     if (g_events.count(start) == 0 || g_events.count(end) == 0) {
         return finish(AEC_ERROR_INVALID_HANDLE);
@@ -542,6 +570,7 @@ aecError_t aecHostRegister(void *ptr, size_t bytes) {
     if (ptr == nullptr || bytes == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
     const uint64_t base = reinterpret_cast<uint64_t>(ptr);
     if (base + bytes < base) return finish(AEC_ERROR_INVALID_ARGUMENT); // overflow
+    std::lock_guard<std::recursive_mutex> submit_lock(g_submit_mutex);
     std::lock_guard<std::mutex> guard(g_mutex);
     for (const HostInterval &interval : g_registrations) {
         const bool overlap = base < interval.base + interval.bytes &&
@@ -555,6 +584,7 @@ aecError_t aecHostRegister(void *ptr, size_t bytes) {
 aecError_t aecHostUnregister(void *ptr) {
     if (ptr == nullptr) return finish(AEC_ERROR_INVALID_ARGUMENT);
     const uint64_t base = reinterpret_cast<uint64_t>(ptr);
+    std::lock_guard<std::recursive_mutex> submit_lock(g_submit_mutex);
     std::lock_guard<std::mutex> guard(g_mutex);
     for (auto it = g_registrations.begin(); it != g_registrations.end(); ++it) {
         if (it->base == base) { // exact base pointer required (docs/02 s.5)
@@ -697,7 +727,12 @@ aecError_t aecMatmulF4(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
 aecError_t aecMatmulF8(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
                        uint32_t m, uint32_t n, uint32_t k,
                        aecFp8Format format, aecStream_t stream) {
-    const uint32_t dtype = format == AEC_FP8_E5M2 ? AEC_DTYPE_FP8_E5M2 : AEC_DTYPE_FP8_E4M3;
+    uint32_t dtype;
+    switch (format) {
+    case AEC_FP8_E4M3: dtype = AEC_DTYPE_FP8_E4M3; break;
+    case AEC_FP8_E5M2: dtype = AEC_DTYPE_FP8_E5M2; break;
+    default: return finish(AEC_ERROR_INVALID_ARGUMENT);
+    }
     return submit_gemm(a, b, c, m, n, k, dtype, stream);
 }
 

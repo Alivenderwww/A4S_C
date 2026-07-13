@@ -8,3 +8,6 @@
 # Python 字节码
 __pycache__/
 *.py[cod]
+
+# Orchestrator deepwork progress (local only)
+.slim/deepwork/
