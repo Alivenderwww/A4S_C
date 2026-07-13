@@ -66,11 +66,13 @@ Word128 encode(const Fields &f) {
       (static_cast<uint16_t>(ty) & kTypeMask) << kTypeShift);
 
   if (f.op == Op::BRX) {
-    // BRX always names its branch predicate in bits [2:0], no enable bit.
+    // BRX always names its branch predicate in bits [2:0], no enable bit; a
+    // `@!%p bra` (branch-when-false) sets pred_neg in [14].
     pred_ctrl |= static_cast<uint16_t>(f.predicate & 0x7u);
   } else if (f.predicate != kPredicateNone) {
     pred_ctrl |= kPredEnable | static_cast<uint16_t>(f.predicate & 0x7u);
   }
+  if (f.pred_neg) pred_ctrl |= static_cast<uint16_t>(1u << 14);
 
   if (f.op == Op::CMP || f.op == Op::CMPP) {
     pred_ctrl |= static_cast<uint16_t>((f.modifier & kFamilyMask) << kFamilyShift);

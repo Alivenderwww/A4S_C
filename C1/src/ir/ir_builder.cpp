@@ -379,7 +379,7 @@ void Builder::translate(const ptx::Instruction &s) {
     if (!s.guardPred.empty()) {
       in.op = Op::BRX;
       in.guard = (int)predId(s.guardPred);
-      if (s.guardNegated) in.note = "negated-guard(TODO)";
+      in.guardNeg = s.guardNegated;            // `@!%p bra` -> branch when !P.
     } else {
       in.op = Op::BR;
       in.hasImm = true; // target resolved to imm in lower.cpp

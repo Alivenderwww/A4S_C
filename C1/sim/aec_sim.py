@@ -179,6 +179,8 @@ class Sim:
                 continue
             if op == "BRX":
                 cond = P[:, ins.pred][active]
+                if ins.pred_neg:                 # `@!%p bra`: branch when !P.
+                    cond = ~cond
                 if cond.size and cond.any() and not cond.all():
                     raise ExecError(
                         "non-uniform BRX at pc=%d (divergent branch — the bounds "

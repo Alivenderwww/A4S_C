@@ -41,6 +41,7 @@ struct Inst {
   Type     type = Type::NONE;
   int      guard = -1;         // guarding predicate id (P0..P7); -1 = none.
                                // For BRX this is the branch predicate.
+  bool     guardNeg = false;   // predicate negated: `@!%p` / BRX takes when !P.
   Operand  dst, s1, s2, s3;
   bool     hasImm = false;
   uint32_t imm    = 0;

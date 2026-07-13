@@ -90,6 +90,7 @@ struct Fields {
   Op       op       = Op::RET;
   Type     type     = Type::NONE;
   uint8_t  predicate = kPredicateNone; // guarding predicate (or BRX branch pred)
+  bool     pred_neg  = false;          // negate the predicate (Pred/Ctrl [14]).
   uint16_t dst      = 0;
   uint16_t src1     = 0;
   uint16_t src2     = 0;

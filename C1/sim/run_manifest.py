@@ -76,7 +76,7 @@ def run_case(folder):
     gemm = None
 
     if chk["type"] == "matmul":                       # C = A @ B, reduced dims
-        M, N, K = 32, 32, 24
+        M, N, K = 32, 32, 128           # full K: exercises the real FP32 accum depth
         gemm = {"M": M, "N": N, "K": K}
         A = rng.standard_normal((M, K)).astype(np.float32)
         B = rng.standard_normal((K, N)).astype(np.float32)
@@ -106,9 +106,12 @@ def run_case(folder):
     ob = chk["output"]
     got = np.frombuffer(bytes(g[base[ob]:base[ob] + arr[ob].size * 4]), np.float32)
     ref = np.asarray(ref, np.float32).reshape(-1)
-    if got.shape == ref.shape and np.allclose(got, ref, rtol=1e-3, atol=1e-3):
-        return "PASS", "cyc=%d" % cyc
-    return "FAIL", "max_diff=%.4g" % float(np.max(np.abs(got - ref)))
+    atol = float(chk.get("atol", 1e-5))              # use the manifest's tolerance
+    rtol = float(chk.get("rtol", 1e-5))
+    if got.shape == ref.shape and np.allclose(got, ref, rtol=rtol, atol=atol):
+        return "PASS", "cyc=%d tol=%g/%g" % (cyc, atol, rtol)
+    return "FAIL", "max_diff=%.4g (tol %g/%g)" % (
+        float(np.max(np.abs(got - ref))), atol, rtol)
 
 
 def main():

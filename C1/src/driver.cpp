@@ -33,6 +33,7 @@ isa::Fields toFields(const ir::Inst &in) {
   } else {
     f.predicate = isa::kPredicateNone;
   }
+  f.pred_neg = in.guardNeg;
 
   f.dst  = (uint16_t)in.dst.value;   // Phys / Pred id.
   f.src1 = (uint16_t)in.s1.value;    // Phys / Special selector.
@@ -383,6 +384,7 @@ std::string disassemble(const binfmt::Image &image) {
     uint16_t ctrl = (uint16_t)(w.word3 & 0xffff);
     uint8_t  ty   = (uint8_t)((ctrl >> 3) & 0xf);
     bool     pEn  = (ctrl & isa::kPredEnable) != 0;
+    bool     pNeg = ((ctrl >> 14) & 1) != 0;
     uint8_t  pred = (uint8_t)(ctrl & 0x7);
     uint16_t dst  = (uint16_t)(w.word2 >> 16);
     uint16_t src1 = (uint16_t)(w.word2 & 0xffff);
@@ -393,7 +395,7 @@ std::string disassemble(const binfmt::Image &image) {
     std::string s;
     char b[192];
     std::snprintf(b, sizeof(b), "  %4u: ", pc); s += b;
-    if (pEn) { std::snprintf(b, sizeof(b), "@P%u ", pred); s += b; }
+    if (pEn) { std::snprintf(b, sizeof(b), "@%sP%u ", pNeg ? "!" : "", pred); s += b; }
 
     switch (op) {
       case isa::Op::LOADI:
@@ -411,7 +413,8 @@ std::string disassemble(const binfmt::Image &image) {
       case isa::Op::BR:
         std::snprintf(b, sizeof(b), "BR ->%u", imm); s += b; break;
       case isa::Op::BRX:
-        std::snprintf(b, sizeof(b), "BRX P%u, ->%u", pred, imm); s += b; break;
+        std::snprintf(b, sizeof(b), "BRX %sP%u, ->%u", pNeg ? "!" : "", pred, imm);
+        s += b; break;
       case isa::Op::LD: {
         uint32_t sp = (ctrl >> 11) & 0x3;
         if (sp == (uint32_t)isa::Space::PMEM || ((ctrl >> 11) & 0x7) == 4)

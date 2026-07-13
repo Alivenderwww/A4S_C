@@ -62,6 +62,7 @@ bool predOpt(ir::Function &fn, const Options &opt) {
   //    with tgt > bi (a skip), whose Pg is produced by a CMPP in the block.
   std::vector<int> guardBlk, cmpAt;
   std::vector<uint32_t> guardPred;
+  std::vector<char> guardNegVec;
   int exitIdx = -1;
   for (int bi = 0; bi < n; ++bi) {
     if (fn.blocks[bi].insts.empty()) continue;
@@ -87,6 +88,7 @@ bool predOpt(ir::Function &fn, const Options &opt) {
     }
     if (cidx < 0) continue;
     guardBlk.push_back(bi); cmpAt.push_back(cidx); guardPred.push_back(pg);
+    guardNegVec.push_back(last.guardNeg ? 1 : 0);
     exitIdx = it->second;
   }
   if (guardBlk.empty()) return false;
@@ -97,8 +99,24 @@ bool predOpt(ir::Function &fn, const Options &opt) {
   int keep = -1;
   for (size_t k = 0; k < guardBlk.size(); ++k) {
     ir::BasicBlock &b = fn.blocks[guardBlk[k]];
+    if (k > 0) {
+      // Chained guard: this compare runs under @keep, so a lane masked off by an
+      // earlier guard does NOT write this predicate and would read a stale
+      // value. Clear it to false first (x != x) so the AND is correct without
+      // relying on any predicate-register reset convention.
+      ir::Operand src = b.insts[cmpAt[k]].s1;
+      ir::Type    cty = b.insts[cmpAt[k]].type;
+      ir::Inst clr; clr.op = ir::Op::CMPP; clr.type = cty;
+      clr.dst = ir::Operand::pred(guardPred[k]);
+      clr.s1 = src; clr.s2 = src; clr.modifier = 1u;   // .ne : x != x -> false
+      b.insts.insert(b.insts.begin() + cmpAt[k], clr);
+      ++cmpAt[k];
+    }
     ir::Inst &cmp = b.insts[cmpAt[k]];
-    cmp.modifier = invertCmp(cmp.modifier);
+    // Flip the branch compare into a keep (execute) predicate. A plain
+    // `@%p bra SKIP` branches when P, so keep = !P -> invert the compare; a
+    // `@!%p bra SKIP` branches when !P, so keep = P -> leave the compare as is.
+    if (!guardNegVec[k]) cmp.modifier = invertCmp(cmp.modifier);
     if (k > 0) cmp.guard = keep;               // P_k = keep_(k-1) && (this cmp).
     keep = (int)guardPred[k];
     b.insts.pop_back();                        // remove the BRX.

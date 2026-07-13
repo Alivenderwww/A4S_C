@@ -107,7 +107,7 @@ class Instr:
         t = "" if self.type == "none" else "." + self.type
         g = ""
         if self.op == "BRX":
-            g = " P%d" % self.pred
+            g = " %sP%d" % ("!" if self.pred_neg else "", self.pred)
         elif self.pred_en:
             g = " @%sP%d" % ("!" if self.pred_neg else "", self.pred)
         extra = ""
