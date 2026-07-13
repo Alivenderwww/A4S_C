@@ -1,8 +1,7 @@
 """aec_decode.py — .aecbin parser + 128-bit AEC instruction decoder.
 
-Independent re-implementation of the C-track AEC encoding (the inverse of
-C1/src/isa/encoder.cpp). Numbering follows C2 starter-kit `aec_isa.h` /
-`docs/03` / `golden/b_isa_public.json` — NOT Track-B spec.md §A.1 (different!).
+Inverse of C1/src/isa/encoder.cpp. Opcode and type numbering follow the AEC
+Precise ISA in Track-B spec.md appendix A (§A.1 opcodes, §4 types).
 
 Word layout (little-endian words w0..w3):
     word3 = (opcode<<16) | pred_ctrl
@@ -23,7 +22,7 @@ golden vectors baked into encoder.cpp.
 import struct
 import sys
 
-# --- opcode numbering (mirror of C1/include/aec/isa.h) --------------------
+# --- opcode numbering (Track-B §A.1, mirror of C1/include/aec/isa.h) -------
 OPCODES = {
     0x0001: "ADD", 0x0002: "SUB", 0x0003: "MUL", 0x0004: "MAD", 0x0005: "FMA",
     0x0006: "DIV", 0x0007: "NEG", 0x0008: "ABS", 0x0009: "MIN", 0x000a: "MAX",
@@ -34,18 +33,17 @@ OPCODES = {
     0x0040: "BR", 0x0041: "BRX", 0x0042: "JMP", 0x0043: "CALL", 0x0044: "RET",
     0x0045: "HALT", 0x0046: "SSYNC", 0x0047: "SYNC_CT", 0x0048: "SYNC_WG",
     0x0049: "MBAR",
-    0x0050: "LOADI", 0x0051: "CPY", 0x0052: "LOADI64", 0x0053: "CVTFF",
-    0x0054: "CVTFI", 0x0055: "CVTIF", 0x0056: "CVTII", 0x0057: "SHUF",
+    0x0050: "CVTFF", 0x0051: "CVTFI", 0x0052: "CVTIF", 0x0053: "CVTII",
+    0x0054: "CPY", 0x0055: "LOADI", 0x0056: "LOADI64", 0x0057: "SHUF",
     0x0058: "VOTE", 0x0059: "MTCH",
     0x0060: "TMUL", 0x0061: "TMUL_S", 0x0062: "TLDA", 0x0063: "TSTA",
     0x0064: "TMOV", 0x0065: "TDUP",
     0x0070: "RCP", 0x0071: "RSQ", 0x0072: "SIN", 0x0073: "COS", 0x0074: "EXP",
     0x0075: "LOG", 0x0076: "SQRT", 0x0080: "RDTSC", 0x0081: "RDPMC",
 }
-# type selector -> name
-TYPES = {0: "f32", 1: "f64", 2: "f16", 3: "bf16", 4: "f8e4m3", 5: "f8e5m2",
-         6: "f4e2m1", 7: "s32", 8: "u32", 9: "s8", 10: "u8", 11: "s4",
-         12: "u4", 13: "b32", 14: "b64", 15: "none"}
+# type selector -> name (Track-B §4)
+TYPES = {0x0: "b32", 0x1: "b64", 0x2: "u32", 0x3: "s32", 0x4: "u8", 0x5: "s8",
+         0x8: "f32", 0x9: "f64", 0xa: "f16", 0xb: "bf16", 0xf: "none"}
 SPACES = {0: "gmem", 1: "smem", 2: "cmem", 3: "lmem", 4: "pmem"}
 CMPS = {0: "eq", 1: "ne", 2: "lt", 3: "le", 4: "gt", 5: "ge"}
 SPECIALS = {0x0100: "tid.x", 0x0101: "ntid.x", 0x0102: "ctaid.x",
@@ -175,22 +173,22 @@ def load_aecbin(path):
 # --- decoder self-test against encoder.cpp's 8 golden vectors --------------
 def _selftest():
     cases = [
-        ("ADD.f32@P3 R1,R2,R3,R4", (4, 3, 65538, 98307),
-         dict(op="ADD", type="f32", pred=3, pred_en=1, dst=1, src1=2, src2=3, src3=4)),
-        ("LOADI.u32 R7", (287454020, 0, 458752, 5242944),
-         dict(op="LOADI", type="u32", dst=7, imm=0x11223344)),
-        ("CPY.u32 R1,%tid.x", (0, 0, 65792, 5308480),
-         dict(op="CPY", type="u32", dst=1, special="tid.x")),
-        ("CMPP.ge.u32 P2,R10,R6", (0, 6, 131082, 2164032),
-         dict(op="CMPP", type="u32", dst=2, src1=10, src2=6, subop=5)),
-        ("BRX P2,9", (9, 0, 0, 4259842),
-         dict(op="BRX", pred=2, imm=9)),
-        ("ST.gmem.f32 [R4],R6", (0, 6, 4, 3211264),
-         dict(op="ST", type="f32", src1=4, src2=6, space=0)),
-        ("TMUL.f16 R64,R32,R48,R64", (64, 48, 4194336, 6291728),
-         dict(op="TMUL", type="f16", dst=64, src1=32, src2=48, src3=64, subop=1)),
-        ("TSTA.f16 [R4],R64", (0, 64, 4, 6488080),
-         dict(op="TSTA", type="f16", src1=4, src2=64)),
+        ("LOADI.none R10,0x100", (256, 0, 655360, 5570680),
+         dict(op="LOADI", type="none", dst=10, imm=0x100)),
+        ("CPY.u32 R1,%laneid", (0, 0, 65796, 5505040),
+         dict(op="CPY", type="u32", dst=1, special="laneid")),
+        ("MUL.u32 R3,R1,R2", (0, 2, 196609, 196624),
+         dict(op="MUL", type="u32", dst=3, src1=1, src2=2)),
+        ("ADD.u32 R10,R10,R3", (0, 3, 655370, 65552),
+         dict(op="ADD", type="u32", dst=10, src1=10, src2=3)),
+        ("CVTIF.f32.u32 R4,R1", (0, 0, 262145, 5376064),
+         dict(op="CVTIF", type="f32", src_type="u32", dst=4, src1=1)),
+        ("CVTFF.f16.f32 R8,R4", (0, 0, 524292, 5251152),
+         dict(op="CVTFF", type="f16", src_type="f32", dst=8, src1=4)),
+        ("ST.gmem.u32 [R10],R8", (0, 8, 10, 3211280),
+         dict(op="ST", type="u32", src1=10, src2=8, space=0)),
+        ("HALT", (0, 0, 0, 4522104),
+         dict(op="HALT", type="none")),
     ]
     ok = True
     for name, words, exp in cases:

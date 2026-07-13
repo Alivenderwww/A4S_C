@@ -1,10 +1,9 @@
 // isa.h - AEC ISA constants + 128-bit instruction encoder/decoder.
 //
-// This is a self-contained re-implementation of the Track-B "aecIsaEncode"
-// bit layout (see public docs/03_AEC_ISA规范.md and golden/b_isa_public.json).
-// The encoder here is verified bit-exact against all 8 golden vectors by
-// aec::isa::selfTest(). Do NOT renumber opcodes/types: the values below are
-// the frozen Track-B allocation.
+// Encodes the AEC Precise ISA from Track-B spec.md appendix A: opcode table
+// (§A.1), 128-bit layout (§3.1), Pred/Ctrl fields (§3.2), type selectors (§4)
+// and the canonical operand/encoding matrix (§5). Verified bit-exact against
+// the Track-B aec_cases program.bin vectors by aec::isa::selfTest().
 #ifndef AEC_ISA_H
 #define AEC_ISA_H
 
@@ -14,7 +13,7 @@
 namespace aec {
 namespace isa {
 
-// --- Opcodes (bits 127:112). Values frozen by b_isa_public.json. ----------
+// --- Opcodes (bits 127:112), Track-B §A.1. --------------------------------
 enum class Op : uint16_t {
   ADD = 0x0001, SUB = 0x0002, MUL = 0x0003, MAD = 0x0004, FMA = 0x0005,
   DIV = 0x0006, NEG = 0x0007, ABS = 0x0008, MIN = 0x0009, MAX = 0x000a,
@@ -30,8 +29,8 @@ enum class Op : uint16_t {
   HALT = 0x0045, SSYNC = 0x0046, SYNC_CT = 0x0047, SYNC_WG = 0x0048,
   MBAR = 0x0049,
 
-  LOADI = 0x0050, CPY = 0x0051, LOADI64 = 0x0052, CVTFF = 0x0053,
-  CVTFI = 0x0054, CVTIF = 0x0055, CVTII = 0x0056, SHUF = 0x0057,
+  CVTFF = 0x0050, CVTFI = 0x0051, CVTIF = 0x0052, CVTII = 0x0053,
+  CPY = 0x0054, LOADI = 0x0055, LOADI64 = 0x0056, SHUF = 0x0057,
   VOTE = 0x0058, MTCH = 0x0059,
 
   TMUL = 0x0060, TMUL_S = 0x0061, TLDA = 0x0062, TSTA = 0x0063,
@@ -43,16 +42,15 @@ enum class Op : uint16_t {
   RDTSC = 0x0080, RDPMC = 0x0081
 };
 
-// --- Type selectors (Pred/Ctrl bits 6:3). ---------------------------------
+// --- Type selectors (Pred/Ctrl bits 6:3), Track-B §4. ---------------------
 enum class Type : uint8_t {
-  F32 = 0, F64 = 1, F16 = 2, BF16 = 3, F8E4M3 = 4, F8E5M2 = 5, F4E2M1 = 6,
-  S32 = 7, U32 = 8, S8 = 9, U8 = 10, S4 = 11, U4 = 12, B32 = 13, B64 = 14,
-  NONE = 15
+  B32 = 0x0, B64 = 0x1, U32 = 0x2, S32 = 0x3, U8 = 0x4, S8 = 0x5,
+  F32 = 0x8, F64 = 0x9, F16 = 0xa, BF16 = 0xb, NONE = 0xf
 };
 
-// --- Memory space (Pred/Ctrl bits 12:11). ---------------------------------
+// --- Memory space (Pred/Ctrl bits 13:11), Track-B §5.3 / §8.1. ------------
 enum class Space : uint8_t {
-  GMEM = 0, SMEM = 1, CMEM = 2, LMEM = 3, PMEM = 4 /* C2 param block */
+  GMEM = 0, SMEM = 1, CMEM = 2, LMEM = 3, PMEM = 4
 };
 
 // --- Compare operation (Pred/Ctrl bits 10:8 for CMP/CMPP). ----------------

@@ -1,8 +1,8 @@
 // encoder.cpp - Bit-exact AEC instruction encoder + golden self-test.
 //
-// Reimplements the Track-B "aecIsaEncode" contract (public docs/03 + the
-// static-inline reference in Track-C/.../include/aec_isa.h). Verified against
-// every vector in golden/b_isa_public.json by selfTest().
+// Implements the Track-B AEC Precise ISA (spec.md §A.1 opcodes, §3 layout /
+// Pred/Ctrl, §4 types, §5 operand placement). Verified against the Track-B
+// aec_cases program.bin vectors by selfTest().
 #include "aec/isa.h"
 
 #include <cstdint>
@@ -18,6 +18,19 @@ static const uint16_t kTypeMask    = 0x000fu;
 static const uint16_t kFamilyMask  = 0x0007u;
 static const uint16_t kSpaceMask   = 0x0007u;
 
+// Track-B §4.1: these opcodes take type .none; their [6:3] field is 0xf.
+static bool isTypeless(Op op) {
+  switch (op) {
+    case Op::LOADI: case Op::LOADI64: case Op::BR: case Op::BRX:
+    case Op::JMP: case Op::CALL: case Op::RET: case Op::HALT:
+    case Op::SSYNC: case Op::SYNC_CT: case Op::SYNC_WG: case Op::MBAR:
+    case Op::VOTE: case Op::MTCH: case Op::RDTSC: case Op::RDPMC:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool usesImmediate(Op op, uint32_t memory_space) {
   return op == Op::LOADI || op == Op::LOADI64 || op == Op::BR ||
          op == Op::BRX || op == Op::CALL || op == Op::SSYNC ||
@@ -25,26 +38,22 @@ bool usesImmediate(Op op, uint32_t memory_space) {
          (op == Op::LD && memory_space == static_cast<uint32_t>(Space::PMEM));
 }
 
+// Tensor precision mode (Pred/Ctrl [10:8]); mode 7 uses the extended selector.
 uint8_t tensorModeForType(Type t) {
   switch (t) {
-    case Type::F32:    return 0;
-    case Type::F16:    return 1;
-    case Type::BF16:   return 2;
-    case Type::S8:     return 3;
-    case Type::S4:     return 4;
-    case Type::F8E4M3: return 5;
-    case Type::F4E2M1: return 6;
+    case Type::F32:  return 0;
+    case Type::F16:  return 1;
+    case Type::BF16: return 2;
+    case Type::S8:   return 3;
     case Type::F64:
-    case Type::S32:
-    case Type::F8E5M2: return 7;   // uses extended selector.
-    default:           return 0xffu;
+    case Type::S32:  return 7;
+    default:         return 0xffu;
   }
 }
 
 uint8_t tensorExtendedModeForType(Type t) {
-  if (t == Type::F64)    return 0;
-  if (t == Type::S32)    return 1;
-  if (t == Type::F8E5M2) return 2; // C2 extension while B reserves selector 2.
+  if (t == Type::F64) return 0;
+  if (t == Type::S32) return 1;
   return 0;
 }
 
@@ -52,10 +61,10 @@ Word128 encode(const Fields &f) {
   Word128 w;
   uint16_t pred_ctrl = 0;
 
-  if (f.type != Type::NONE) {
-    pred_ctrl |= static_cast<uint16_t>(
-        (static_cast<uint16_t>(f.type) & kTypeMask) << kTypeShift);
-  }
+  // Type field [6:3]: the value for typed ops, 0xf (.none) for typeless ones.
+  const Type ty = isTypeless(f.op) ? Type::NONE : f.type;
+  pred_ctrl |= static_cast<uint16_t>(
+      (static_cast<uint16_t>(ty) & kTypeMask) << kTypeShift);
 
   if (f.op == Op::BRX) {
     // BRX always names its branch predicate in bits [2:0], no enable bit.
@@ -78,9 +87,8 @@ Word128 encode(const Fields &f) {
     pred_ctrl |= static_cast<uint16_t>((f.modifier & kFamilyMask) << kFamilyShift);
   } else if (f.op == Op::CVTFF || f.op == Op::CVTFI ||
              f.op == Op::CVTIF || f.op == Op::CVTII) {
-    // CVT*: destination type is already in [6:3] (from f.type); the SOURCE type
-    // goes in [13:10] (f.modifier carries it), with [9:7]=0. Field layout per
-    // Track-B §5.4 — assumed identical for the C-track (confirm w/ organizers).
+    // Track-B §5.3: destination type in [6:3] (f.type), source type in [13:10]
+    // (f.modifier), [9:7]=0.
     pred_ctrl |= static_cast<uint16_t>((f.modifier & 0xfu) << 10);
   } else if (f.op == Op::MBAR) {
     pred_ctrl |= static_cast<uint16_t>((f.modifier & 0x3u) << kFamilyShift);
@@ -134,14 +142,12 @@ const char *opName(Op op) {
 
 const char *typeName(Type t) {
   switch (t) {
+    case Type::B32: return "b32"; case Type::B64: return "b64";
+    case Type::U32: return "u32"; case Type::S32: return "s32";
+    case Type::U8: return "u8"; case Type::S8: return "s8";
     case Type::F32: return "f32"; case Type::F64: return "f64";
     case Type::F16: return "f16"; case Type::BF16: return "bf16";
-    case Type::F8E4M3: return "f8e4m3"; case Type::F8E5M2: return "f8e5m2";
-    case Type::F4E2M1: return "f4e2m1"; case Type::S32: return "s32";
-    case Type::U32: return "u32"; case Type::S8: return "s8";
-    case Type::U8: return "u8"; case Type::S4: return "s4";
-    case Type::U4: return "u4"; case Type::B32: return "b32";
-    case Type::B64: return "b64"; case Type::NONE: return "";
+    case Type::NONE: return "";
   }
   return "?";
 }
@@ -161,57 +167,57 @@ Word128 W(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) {
 bool selfTest() {
   Golden g[8];
 
-  // ADD.f32 @P3 R1,R2,R3,R4  -> [4, 3, 65538, 98307]
-  g[0].name = "ADD.f32@P3 R1,R2,R3,R4";
-  g[0].expect = W(4, 3, 65538, 98307);
-  g[0].fields.op = Op::ADD; g[0].fields.type = Type::F32;
-  g[0].fields.predicate = 3; g[0].fields.dst = 1; g[0].fields.src1 = 2;
-  g[0].fields.src2 = 3; g[0].fields.src3 = 4;
+  // Vectors are the encoded instructions of Track-B aec_cases/cvtff, decoded
+  // from its program.bin. w = [w0, w1, w2, w3].
 
-  // LOADI.u32 R7,0x11223344 -> [287454020, 0, 458752, 5242944]
-  g[1].name = "LOADI.u32 R7,0x11223344";
-  g[1].expect = W(287454020u, 0, 458752, 5242944);
-  g[1].fields.op = Op::LOADI; g[1].fields.type = Type::U32;
-  g[1].fields.dst = 7; g[1].fields.imm = 0x11223344u;
+  // LOADI.none R10, 0x100
+  g[0].name = "LOADI.none R10,0x100";
+  g[0].expect = W(256, 0, 655360, 5570680);
+  g[0].fields.op = Op::LOADI; g[0].fields.dst = 10; g[0].fields.imm = 0x100;
 
-  // CPY.u32 R1,%tid.x -> [0, 0, 65792, 5308480]
-  g[2].name = "CPY.u32 R1,%tid.x";
-  g[2].expect = W(0, 0, 65792, 5308480);
-  g[2].fields.op = Op::CPY; g[2].fields.type = Type::U32;
-  g[2].fields.dst = 1; g[2].fields.src1 = TID_X;
+  // CPY.u32 R1, %laneid
+  g[1].name = "CPY.u32 R1,%laneid";
+  g[1].expect = W(0, 0, 65796, 5505040);
+  g[1].fields.op = Op::CPY; g[1].fields.type = Type::U32;
+  g[1].fields.dst = 1; g[1].fields.src1 = LANEID;
 
-  // CMPP.ge.u32 P2,R10,R6 -> [0, 6, 131082, 2164032]
-  g[3].name = "CMPP.ge.u32 P2,R10,R6";
-  g[3].expect = W(0, 6, 131082, 2164032);
-  g[3].fields.op = Op::CMPP; g[3].fields.type = Type::U32;
-  g[3].fields.dst = 2; g[3].fields.src1 = 10; g[3].fields.src2 = 6;
-  g[3].fields.modifier = static_cast<uint32_t>(Cmp::GE);
+  // MUL.u32 R3, R1, R2
+  g[2].name = "MUL.u32 R3,R1,R2";
+  g[2].expect = W(0, 2, 196609, 196624);
+  g[2].fields.op = Op::MUL; g[2].fields.type = Type::U32;
+  g[2].fields.dst = 3; g[2].fields.src1 = 1; g[2].fields.src2 = 2;
 
-  // BRX P2,9 -> [9, 0, 0, 4259842]
-  g[4].name = "BRX P2,9";
-  g[4].expect = W(9, 0, 0, 4259842);
-  g[4].fields.op = Op::BRX; g[4].fields.type = Type::NONE;
-  g[4].fields.predicate = 2; g[4].fields.imm = 9;
+  // ADD.u32 R10, R10, R3
+  g[3].name = "ADD.u32 R10,R10,R3";
+  g[3].expect = W(0, 3, 655370, 65552);
+  g[3].fields.op = Op::ADD; g[3].fields.type = Type::U32;
+  g[3].fields.dst = 10; g[3].fields.src1 = 10; g[3].fields.src2 = 3;
 
-  // ST.gmem.f32 [R4],R6 -> [0, 6, 4, 3211264]
-  g[5].name = "ST.gmem.f32 [R4],R6";
-  g[5].expect = W(0, 6, 4, 3211264);
-  g[5].fields.op = Op::ST; g[5].fields.type = Type::F32;
-  g[5].fields.src1 = 4; g[5].fields.src2 = 6;
-  g[5].fields.modifier = static_cast<uint32_t>(Space::GMEM);
+  // CVTIF.f32.u32 R4, R1  (dst type f32 in [6:3], src type u32 in [13:10])
+  g[4].name = "CVTIF.f32.u32 R4,R1";
+  g[4].expect = W(0, 0, 262145, 5376064);
+  g[4].fields.op = Op::CVTIF; g[4].fields.type = Type::F32;
+  g[4].fields.dst = 4; g[4].fields.src1 = 1;
+  g[4].fields.modifier = static_cast<uint32_t>(Type::U32);
 
-  // TMUL.f16 R64,R32,R48,R64 -> [64, 48, 4194336, 6291728]
-  g[6].name = "TMUL.f16 R64,R32,R48,R64";
-  g[6].expect = W(64, 48, 4194336, 6291728);
-  g[6].fields.op = Op::TMUL; g[6].fields.type = Type::F16;
-  g[6].fields.dst = 64; g[6].fields.src1 = 32; g[6].fields.src2 = 48;
-  g[6].fields.src3 = 64;
+  // CVTFF.f16.f32 R8, R4
+  g[5].name = "CVTFF.f16.f32 R8,R4";
+  g[5].expect = W(0, 0, 524292, 5251152);
+  g[5].fields.op = Op::CVTFF; g[5].fields.type = Type::F16;
+  g[5].fields.dst = 8; g[5].fields.src1 = 4;
+  g[5].fields.modifier = static_cast<uint32_t>(Type::F32);
 
-  // TSTA.f16 [R4],R64 -> [0, 64, 4, 6488080]
-  g[7].name = "TSTA.f16 [R4],R64";
-  g[7].expect = W(0, 64, 4, 6488080);
-  g[7].fields.op = Op::TSTA; g[7].fields.type = Type::F16;
-  g[7].fields.src1 = 4; g[7].fields.src2 = 64; g[7].fields.modifier = 0;
+  // ST.gmem.u32 [R10], R8
+  g[6].name = "ST.gmem.u32 [R10],R8";
+  g[6].expect = W(0, 8, 10, 3211280);
+  g[6].fields.op = Op::ST; g[6].fields.type = Type::U32;
+  g[6].fields.src1 = 10; g[6].fields.src2 = 8;
+  g[6].fields.modifier = static_cast<uint32_t>(Space::GMEM);
+
+  // HALT
+  g[7].name = "HALT";
+  g[7].expect = W(0, 0, 0, 4522104);
+  g[7].fields.op = Op::HALT;
 
   bool ok = true;
   for (int i = 0; i < 8; ++i) {

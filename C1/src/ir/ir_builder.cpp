@@ -25,8 +25,8 @@ namespace {
 
 bool isTypeName(const std::string &s) {
   static const char *kTypes[] = {
-      "f32","f64","f16","bf16","f8e4m3","f8e5m2","f4e2m1","s32","u32",
-      "s8","u8","s4","u4","b32","b64","u64","s64","u16","s16","b16","pred"};
+      "f32","f64","f16","bf16","s32","u32","s8","u8",
+      "b32","b64","u64","s64","u16","s16","b16","pred"};
   for (unsigned i = 0; i < sizeof(kTypes) / sizeof(kTypes[0]); ++i)
     if (s == kTypes[i]) return true;
   return false;
@@ -37,15 +37,10 @@ Type mapType(const std::string &s) {
   if (s == "f64") return Type::F64;
   if (s == "f16") return Type::F16;
   if (s == "bf16") return Type::BF16;
-  if (s == "f8e4m3") return Type::F8E4M3;
-  if (s == "f8e5m2") return Type::F8E5M2;
-  if (s == "f4e2m1") return Type::F4E2M1;
   if (s == "s32") return Type::S32;
   if (s == "u32") return Type::U32;
   if (s == "s8") return Type::S8;
   if (s == "u8") return Type::U8;
-  if (s == "s4") return Type::S4;
-  if (s == "u4") return Type::U4;
   if (s == "b32") return Type::B32;
   if (s == "b64" || s == "u64" || s == "s64") return Type::B64;
   if (s == "u16" || s == "s16" || s == "b16") return Type::B32; // 16b in a 32b reg
@@ -53,8 +48,7 @@ Type mapType(const std::string &s) {
 }
 
 bool isFloatType(Type t) {
-  return t == Type::F32 || t == Type::F64 || t == Type::F16 || t == Type::BF16 ||
-         t == Type::F8E4M3 || t == Type::F8E5M2 || t == Type::F4E2M1;
+  return t == Type::F32 || t == Type::F64 || t == Type::F16 || t == Type::BF16;
 }
 
 // AEC addresses are 32-bit byte offsets and there is no 64-bit integer ALU
