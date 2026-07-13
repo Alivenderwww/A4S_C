@@ -333,7 +333,9 @@ class Sim:
                 v = np.trunc(read_float(s1, st)).astype(np.int64)
                 wr_u32(d, (v & 0xffffffff).astype(np.uint32)); return
         if op == "LD":
-            width = 8 if ty in ("b64", "f64") else 4
+            if ty not in ("b32", "b64", "u32", "s32", "f32"):
+                raise ExecError("illegal LD type '.%s' (Track-B §4.1)" % ty)
+            width = 8 if ty == "b64" else 4
             if ins.space == 4:  # pmem, addr = imm offset (uniform)
                 addr = np.full(W, ins.imm, np.uint32)
                 mem = self.pmem
@@ -347,12 +349,11 @@ class Sim:
                 R[:, (d + 1) & 0xff] = np.where(em, hi, R[:, (d + 1) & 0xff])
             return
         if op == "ST":
+            if ty not in ("b32", "u32", "s32", "f32"):
+                raise ExecError("illegal ST type '.%s' (Track-B §4.1: ST is 32-bit)" % ty)
             addr = R[:, s1]
             mem = {0: self.gmem, 1: smem, 3: lmem}.get(ins.space, self.gmem)
             self._store(mem, addr, 4, R[:, s2], em)
-            if ty in ("b64", "f64"):              # store the high word too.
-                self._store(mem, (addr.astype(np.int64) + 4).astype(np.uint32), 4,
-                            R[:, (s2 + 1) & 0xff], em)
             return
         # anything else: flag (helps find missing lowering / illegal ops)
         raise ExecError("unimplemented/illegal op '%s.%s' at runtime" % (op, ty))
