@@ -196,6 +196,7 @@ void runOptPasses(ir::Function &fn, const Options &opt) {
   // Two light rounds so an implemented pass can feed the next.
   for (int round = 0; round < 2; ++round) {
     if (opt.const_prop)   passes::constProp(fn, opt);
+    if (opt.copy_prop)    passes::copyProp(fn, opt);
     if (opt.cse)          passes::cse(fn, opt);
     if (opt.mad_contract) passes::madContract(fn, opt);
     if (opt.licm)         passes::licm(fn, opt);

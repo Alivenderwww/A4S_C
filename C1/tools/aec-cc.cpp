@@ -81,6 +81,7 @@ int main(int argc, char **argv) {
     else if (a == "--no-const-prop") { opt.const_prop = false; }
     else if (a == "--no-dce") { opt.dce = false; }
     else if (a == "--no-cse") { opt.cse = false; }
+    else if (a == "--no-copy-prop") { opt.copy_prop = false; }
     else if (a == "--no-licm") { opt.licm = false; }
     else if (a == "--no-mad-contract") { opt.mad_contract = false; }
     else if (a == "--no-pred-opt") { opt.pred_opt = false; }
