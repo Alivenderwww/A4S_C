@@ -62,6 +62,7 @@ class Sim:
         self.strict = strict
         self.max_cycles = max_cycles
         self.total_cycles = 0
+        self.stall_cycles = 0    # cycles a warp waits on operand (memory) latency
         self.warps = 0
 
     # ---- memory helpers (per-lane gather/scatter) ------------------------
@@ -151,6 +152,8 @@ class Sim:
                 if pready[ins.pred] > t:
                     t = pready[ins.pred]
             if t > clock or issued >= 2:            # stall for operand or 2-wide issue
+                if t > clock + 1:                   # operand-wait (memory latency) stall
+                    self.stall_cycles += t - (clock + 1)
                 clock = t if t > clock + 1 else clock + 1
                 issued = 0
             issued += 1
