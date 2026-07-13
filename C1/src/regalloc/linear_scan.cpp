@@ -11,7 +11,14 @@
 // fixpoint over the CFG, so back-edges extend ranges over the whole loop),
 // derives an interval per virtual register from live-in/live-out + def/use
 // positions, then does the standard linear scan (assign R1..R255, expire on
-// interval end). Spilling is still a STUB (clamp to the top register + count).
+// interval end). Spilling is a STUB (clamp to the top register + count), but at
+// -O2 the spill path is effectively unreachable: the pre-RA list scheduler
+// sinks each independent value to its use, so peak pressure stays tiny -- a
+// kernel with 300 simultaneously-defined runtime values allocates ~6 physical
+// registers and 0 spills (measured; see sim/cmodel/pressure.py). Reaching a
+// spill needs >255 values live at one point with no schedule that separates
+// them, which the scalar §3 subset (binary ops, no offset addressing) makes
+// pathological. So a full lmem spiller is deliberately not implemented.
 #include "aec/passes.h"
 #include "aec/target.h"
 
