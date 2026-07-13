@@ -36,20 +36,16 @@ C3 算子调度 : ONNX 模型    ──►  AEC GPGPU 推理
 2. 再读 [`docs/赛道C-知识库与作战手册.md`](./docs/赛道C-知识库与作战手册.md) §1，搞清「实际给了什么 / 要自建什么」。
 3. 最后按子题精读 [`docs/Track-C-Reading-Notes.md`](./docs/Track-C-Reading-Notes.md)（§1–§3 摘要 + §6 配套背景，每节标注来源 URL 与对应子题）。
 
-## 远程执行工具 `scripts/remote_exec.py`
+## 远程执行工具
 
-在远程服务器（他人提供的固定账号）上执行命令（如编译、跑 grader）并取回结果。跨平台（Windows / Linux / macOS），仅依赖 Python 标准库 + 系统 `ssh`，无需 pip 安装。
+远程执行相关内容（`scripts/remote_exec.py` 等）不在此文档中维护，请以项目内实际部署说明为准。
 
-**固定连接**：`ssh -i ./mig02 mig02@39.107.68.147 -p 1102`
+## C1 状态快照
 
-**用法**：
+当前实现状态、验证数字、完成度、风险、优先级等全部维护在 [`docs/C1-完成度审计.md`](./docs/C1-完成度审计.md)（工程状态唯一事实源）。本文不再重复维护可漂移的状态断言。
 
+**稳定测试入口**：
 ```bash
-python scripts/remote_exec.py "cd ~/A4S && make -j2 2>&1"   # 实时流式输出（看得到编译进度）
-python scripts/remote_exec.py --dry-run make                 # 只看 ssh 命令，不连接
-python scripts/remote_exec.py --json python3 grader/x.py     # 结束后 stdout 输出 JSON
+cd C1 && make selftest && make test
+cd C1/sim && py -3.13 dogfood.py && py -3.13 bench.py
 ```
-
-退出码 = 远程退出码；默认模式远程 stdout/stderr 实时透传，stderr 末行 `[remote_exec] exit=N`。私钥放当前目录命名 `mig02`（找不到会自动从 `~/.ssh/mig02` 复制并 `chmod 600`；已 gitignore）。
-
-> ⚠️ 公网流量有限，**禁止上传/下载大文件**；**禁止隧道 / 端口转发**（脚本已强制 `ClearAllForwardings=yes`）。

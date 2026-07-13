@@ -7,13 +7,10 @@
 
 - 前端：PTX 词法/语法分析 → PTX AST。
 - 中端：AST → 内部 IR（基本块 + CFG）→ 优化 pass 流水线。
-- 后端：寄存器分配 → 指令调度 → 代码生成/降级 → 128-bit 编码 → `.aecbin` 容器。
+- 后端：GEMM→TMUL 降级 → 循环展开 → 列表调度(pre-RA) → 线性扫描分配 → 降级 → 128-bit 编码 → `.aecbin` 容器。
 - 工具：`aec-cc`（编译器）、`aec-objdump`（反汇编器）、`agent/run_agent.py`（自动调优）。
 
-当前状态：**最小可用路径已打通、可编译可运行**。编码器（`src/isa/encoder.cpp`）与全部 8 条
-golden 向量逐位一致；PTX-01~05 五个公开用例均能编译成合法 `.aecbin` 并被 `aec-objdump`
-往返为可读汇编。**优化 pass 目前为“接线好的空实现”（identity stub）**，每个都带 `TODO(Tx)`
-标注对应评分类别，等待 C1 负责人填充真实算法（见第 8 节 TODO 清单）。
+具体完成度、验证数字、风险、TODO 详见 [`../docs/C1-完成度审计.md`](../docs/C1-完成度审计.md)（工程状态唯一事实源）。
 
 > 重要：本仓库只在 `C1/` 目录下工作，**不修改** `public/` 下的任何官方素材。
 
@@ -34,9 +31,9 @@ C1/
 │   ├── passes.h                 各阶段函数声明（buildIR/buildCFG/passes/regalloc/…）
 │   └── driver.h                 前端 parse + 完整 compile 流水线 + 反汇编 API
 ├── src/
-│   ├── isa/encoder.cpp          【已完成】逐位编码器 + golden 自检
-│   ├── ptx/lexer.cpp            【已完成】PTX 分词器
-│   ├── ptx/ptx_lexer.h          【已完成】词法私有接口
+│   ├── isa/encoder.cpp          逐位编码器 + golden 自检
+│   ├── ptx/lexer.cpp            PTX 分词器
+│   ├── ptx/ptx_lexer.h          词法私有接口
 │   ├── ptx/parser.cpp           tokens → PTX AST（递归下降）
 │   ├── ir/ir_builder.cpp        PTX AST → IR + 指令选择 + 基本块切分
 │   ├── ir/cfg.cpp               CFG 构建（succ/pred）
@@ -46,9 +43,9 @@ C1/
 │   ├── passes/licm.cpp          循环不变量外提    （T2）
 │   ├── passes/mem_coalesce.cpp  内存合并/复用     （T3）
 │   ├── passes/pred_opt.cpp      谓词执行优化      （T2）
-│   ├── regalloc/linear_scan.cpp 256-GPR 线性扫描分配 + spill 桩（T4）
-│   ├── sched/list_sched.cpp     DDG + 列表调度 + 双发射配对桩（T4）
-│   ├── codegen/gemm_tmul.cpp    GEMM 识别 + TMUL 降级桩（T5）
+│   ├── regalloc/linear_scan.cpp 256-GPR 线性扫描分配（T4）
+│   ├── sched/list_sched.cpp     DDG + 列表调度 + 双发射配对（T4）
+│   ├── codegen/gemm_tmul.cpp    GEMM 识别 + TMUL 降级（T5）
 │   ├── codegen/lower.cpp        末端合法化 + 展平 + 分支目标解析（T1）
 │   ├── binfmt/writer.cpp        .aecbin 序列化
 │   ├── binfmt/reader.cpp        .aecbin 解析
@@ -142,8 +139,9 @@ python3 agent/run_agent.py input.ptx -o out.aecbin --report agent_report.json
       ▼
    优化后 IR
       │  gemm_tmul.cpp（GEMM 识别 + TMUL 降级）
+      │  unroll.cpp（循环展开，-O3 按选项）
+      │  list_sched.cpp（DDG + 列表调度 + 双发射配对，pre-RA）
       │  linear_scan.cpp（虚拟寄存器 → 物理 R1..R255）
-      │  list_sched.cpp（DDG + 列表调度 + 双发射配对）
       │  lower.cpp（展平 + 分支标签 → 绝对 PC）
       ▼
    线性 ir::Inst 流
@@ -208,8 +206,7 @@ TMUL mode：`f32=0 f16=1 bf16=2 s8=3 s4=4 f8e4m3=5 f4e2m1=6`，mode 7 扩展 `f6
 | `ST.gmem.type [Ra],Rs` | Dest=0，Src1=地址，Src2=源 |
 | `TLDA/TMUL/TSTA`       | tensor tile，精度 mode 在 [10:8] |
 
-> golden 验证：`src/isa/encoder.cpp::selfTest()` 内置 8 条向量，与
-> `public/.../golden/b_isa_public.json` 逐位一致，可用 `bin/aec-cc --selftest` 运行。
+> golden 验证：自检结果见 [`../docs/C1-完成度审计.md`](../docs/C1-完成度审计.md) §二；可用 `bin/aec-cc --selftest` 运行。
 
 ---
 
@@ -234,56 +231,15 @@ TMUL mode：`f32=0 f16=1 bf16=2 s8=3 s4=4 f8e4m3=5 f4e2m1=6`，mode 7 扩展 `f6
 
 ---
 
-## 8. TODO 清单（按 T1–T5 权重组织）
+## 8. 后续工作与风险
 
-正确性权重 `T1×4 + T2×8 + T3×10 + T4×12 + T5×16`（T5 最高）；性能分 T3=9/T4=10/T5=11。
-建议按下列优先级推进（**P0 最高**）：
+所有实现状态、验证数字、风险、TODO 的完整清单见
+[`../docs/C1-完成度审计.md`](../docs/C1-完成度审计.md)：
 
-### T5 — Tensor/GEMM（正确性 16、性能 11，最高价值）
-- **[P0]** `src/codegen/gemm_tmul.cpp::lowerGemmToTmul`：把已识别的 K-loop MAD 累加改写为
-  `TLDA/TLDA/TMUL/TSTA` tile 序列；按累加类型选精度 mode（FP4/FP8/FP16/BF16/FP32/FP64/
-  INT4/INT8/INT32，见 scoring.md 第 8 节 9 种精度）；tile 大小自适应（16×16 起，处理非 16
-  倍数边界）。编码器已支持 TMUL/TLDA/TSTA，只差 IR 改写。
+| 审计章节 | 内容 |
+|-----------|------|
+| §三–§五 | 实现矩阵、完成度估计、优先级与 TODO |
+| §七 | 完整风险清单（自建 oracle 边界、工程风险） |
+| §六 | Performance Model 参数表与缺失假设 |
 
-### T4 — 寄存器与调度（正确性 12、性能 10）
-- **[P1]** `src/regalloc/linear_scan.cpp`：实现真正的 **spill**（选牺牲区间、分配 LMEM 槽、
-  在 def/use 处插入 ST/LD、改写操作数）。当前超 255 寄存器时仅计数并钳位到 R255（桩）。
-- **[P1]** `src/sched/list_sched.cpp`：构建完整 DDG（RAW/WAR/WAW + AEC 延迟），按关键路径
-  高度做 ready-list 列表调度，交织 LD/计算隐藏访存延迟并最大化双发射配对。当前仅统计相邻
-  可配对数、**不重排**。
-
-### T3 — 内存优化（正确性 10、性能 9）
-- **[P2]** `src/passes/mem_coalesce.cpp`：合并同基址+仿射偏移的相邻访问为宽事务；把循环不变
-  的重复 load 提升到 SMEM（`TLDA`）/寄存器。PTX-03 的 `[%rd5]` 每次迭代重载是典型目标。
-
-### T2 — 控制与标量优化（正确性 8、性能 5）
-- **[P2]** `src/passes/cse.cpp`：对纯指令做值编号并复用（PTX-02 有两条相同 `add.f32` +
-  冗余 `mul.f32`）。
-- **[P2]** `src/passes/licm.cpp`：从 CFG back-edge 识别循环，把不变量提升到 preheader
-  （PTX-02 的 `%f1+%f2` 在 LOOP 内却是不变量）。
-- **[P3]** `src/passes/const_prop.cpp`：LOADI 常量折叠 + 传播。
-- **[P3]** `src/passes/dce.cpp`：按 use-count 删除无副作用死指令（迭代到不动点）。
-- **[P3]** `src/passes/pred_opt.cpp`：小分支 if-conversion 成谓词直线代码（各用例尾部的
-  `@%pN bra DONE`）。
-
-### T1 — 基础 Lowering（正确性 4，门禁基础）
-- **[P1]** `src/ir/ir_builder.cpp`：完善 lowering 语义正确性——
-  `mul.wide` 的 64 位结果、`add.u64` 的寄存器对（R[n]:R[n+1]）进位、`cvt` 各精度规则、
-  `@!%pN`（谓词取反）分支、`mov` 各类型；补充未覆盖 PTX 指令。
-- **[P3]** `src/driver.cpp`：支持多 kernel 输出（当前只发第一个 kernel）。
-
----
-
-## 9. 风险提示
-
-- **无 golden model / cycle model**：C1 未随包提供参考执行模型与周期模型。因此：
-  - 只能用 `b_isa_public.json` 对**编码**做逐位自检（已通过），**无法**本地验证执行语义正确性；
-  - Agent 的 `est_cycles` 是编译器自带的**启发式估算**（`driver.cpp::estimateCycles`），
-    不是官方周期数。真实周期模型可用后，应替换 `agent/run_agent.py::read_cycles` 的来源。
-- **仅覆盖真实 PTX 子集**：解析器按公开用例（真实 NVIDIA PTX：`.version 7.0`/`sm_70`/
-  `%tid.x`/`mad.lo.u32`/`setp`/`bra` 等）实现；未识别的指令会打 `UNHANDLED:` 标记而非报错
-  （利于鲁棒性变异测试），但语义未覆盖，需按 T1 TODO 扩展。
-- **优化 pass 为 identity 桩**：当前 `-O0` 与 `-O2/-O3` 生成的代码相同，性能分尚未启动；
-  正确性门禁依赖 lowering + 编码（已通路），性能收益需按第 8 节填充。
-- **64-bit 地址近似**：`add.u64`/`mul.wide` 目前按 32 位近似处理，未实现寄存器对进位，
-  是执行正确性的已知缺口（见 T1 TODO）。
+本文不再重复维护可漂移的状态断言、优先级列表或风险明细。
