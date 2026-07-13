@@ -27,12 +27,41 @@ if _C3_ROOT not in sys.path:
 from scheduler.graph import import_onnx_graph
 from tools import export_dag, infer
 
-_PUBLIC = os.path.normpath(os.path.join(
-    _C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest", "Track-C", "C3-scheduler",
-    "testcases", "release_to_competitors",
-))
-_MODELS = os.path.join(_PUBLIC, "models")
-_TESTDATA = os.path.join(_PUBLIC, "testdata", "c35")
+# Resolve model/testdata locations defensively: try the repo layout (public/...)
+# first, then the flat server layout (models + testdata_<key> under C3_ROOT).
+_REPO_PUBLIC = os.path.normpath(os.path.join(
+    _C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest", "Track-C",
+    "C3-scheduler", "testcases", "release_to_competitors"))
+
+# server/flat layout maps a model key to its testdata dir name
+_SERVER_TD = {"mlp_v1": "testdata_mlp", "resnet_v1": "testdata_resnet", "transformer_v1": "testdata_tf"}
+
+
+def _resolve_models():
+    """Find the directory holding the .onnx files."""
+    repo_models = os.path.join(_REPO_PUBLIC, "models")
+    if os.path.isdir(repo_models):
+        return repo_models
+    if any(f.endswith(".onnx") for f in os.listdir(_C3_ROOT)
+           if os.path.isfile(os.path.join(_C3_ROOT, f))):
+        return _C3_ROOT
+    return repo_models  # fallback (will SKIP gracefully if missing)
+
+
+def _resolve_testdata(model_key):
+    """Find the testdata dir for one model; returns parent containing input/ & golden/."""
+    # repo layout: public/.../testdata/c35/<model_key>/{input,golden}
+    repo_td = os.path.join(_REPO_PUBLIC, "testdata", "c35", model_key)
+    if os.path.isdir(os.path.join(repo_td, "input")):
+        return repo_td
+    # server layout: C3_ROOT/testdata_<short>/{input,golden}
+    srv_td = os.path.join(_C3_ROOT, _SERVER_TD.get(model_key, ""))
+    if os.path.isdir(os.path.join(srv_td, "input")):
+        return srv_td
+    return repo_td  # fallback (test_c35 will SKIP)
+
+
+_MODELS = _resolve_models()
 
 MODELS = {
     "mlp_v1": {"onnx": "mlp_v1.onnx", "in": "input", "out": "logits", "acc_gate": 0.98},
@@ -83,8 +112,9 @@ def test_c31(model_key, cfg, tmp):
 
 def test_c35(model_key, cfg, tmp):
     onnx_path = os.path.join(_MODELS, cfg["onnx"])
-    in_dir = os.path.join(_TESTDATA, model_key, "input")
-    gold_path = os.path.join(_TESTDATA, model_key, "golden", "logits.npy")
+    td = _resolve_testdata(model_key)
+    in_dir = os.path.join(td, "input")
+    gold_path = os.path.join(td, "golden", "logits.npy")
     if not os.path.isdir(in_dir) or not os.path.exists(gold_path):
         print(f"  SKIP  [C3.5 {model_key}] testdata missing")
         return
@@ -100,7 +130,7 @@ def test_c35(model_key, cfg, tmp):
     md = float(np.max(np.abs(out - gold)))
     check(ok, f"[C3.5 {model_key}] allclose(1e-3) max_abs_diff={md:.2e}")
 
-    labels_path = os.path.join(_TESTDATA, model_key, "labels.npy")
+    labels_path = os.path.join(td, "labels.npy")
     if cfg["acc_gate"] is not None and os.path.exists(labels_path):
         labels = np.load(labels_path)
         acc = float((out.argmax(axis=-1) == labels).mean())

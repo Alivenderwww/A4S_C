@@ -4,11 +4,11 @@
 # CPU 环境（自测 / C3.1 / C3.3 数值对齐）足够：
 numpy>=1.24
 onnx>=1.15
-onnxruntime>=1.17          # CPU 版；评测机若有 GPU 请改用 onnxruntime-gpu
+onnxruntime>=1.17          # CPU 版；C3.5 的 ort 后端回退用
 #
-# GPU 环境（C3.5 正式评测，追求运行时间/显存排名）：
-#   pip uninstall onnxruntime
-#   pip install onnxruntime-gpu   # 需与评测机 CUDA/cuDNN 版本匹配
+# GPU 环境（C3.5 正式评测，spec 要求"数值计算库统一采用 CuPy"）：
+cupy>=13.0                 # C3.5 默认 GPU 后端（tools/infer.py --backend cupy）
+#   安装需匹配评测机 CUDA 版本，例如 CUDA 12.x: pip install cupy-cuda12x
 #
-# 说明：tools/infer.py 会自动探测 CUDAExecutionProvider，找不到则回退 CPU，
-#       再回退 onnx.reference.ReferenceEvaluator（无需 onnxruntime 也能跑，但很慢）。
+# 说明：tools/infer.py 默认用 CuPy 后端（手写算子），--backend ort 切到 onnxruntime。
+#       CuPy 不可用时自动回退 ort(CPU) -> onnx.reference（能跑但慢）。
