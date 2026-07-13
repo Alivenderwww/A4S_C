@@ -1,0 +1,37 @@
+.version 9.3
+.target sm_90
+.address_size 64
+
+// Fused-vs-non-fused probe: a*b rounds, then +c rounds.
+// a=b=4097, a*b=16785409 -> f32 16785408 (round-even loses +1); c=-16785408.
+//   MAD.f32 (non-fused): round(round(a*b)+c) = 0
+//   FMA.f32 (fused):     round(a*b+c)        = 1
+.visible .entry mad_fma_probe(
+    .param .u64 pa,
+    .param .u64 pb,
+    .param .u64 pc,
+    .param .u64 pm,
+    .param .u64 pf
+)
+{
+    .reg .u64 %rd<8>;
+    .reg .f32 %f<8>;
+
+    ld.param.u64 %rd1, [pa];
+    ld.param.u64 %rd2, [pb];
+    ld.param.u64 %rd3, [pc];
+    ld.param.u64 %rd4, [pm];
+    ld.param.u64 %rd5, [pf];
+
+    ld.global.f32 %f1, [%rd1];
+    ld.global.f32 %f2, [%rd2];
+    ld.global.f32 %f3, [%rd3];
+
+    mad.f32 %f4, %f1, %f2, %f3;
+    fma.rn.f32 %f5, %f1, %f2, %f3;
+
+    st.global.f32 [%rd4], %f4;
+    st.global.f32 [%rd5], %f5;
+
+    ret;
+}

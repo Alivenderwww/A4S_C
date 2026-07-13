@@ -305,9 +305,11 @@ void Builder::translate(const ptx::Instruction &s) {
     return;
   }
 
-  // PTX mad.f32 on sm_70 is FUSED (single rounding = fma); only integer mad
-  // maps to AEC MAD (mul rounds, then add rounds). See C1_实现流程分析.md §1.5.
-  if (m == "mad")  { lowerFMA(isFloatType(ty) ? Op::FMA : Op::MAD, ty, s); return; }
+  // spec §9 + §6.2: `mad` -> MAD (non-fused: the multiply rounds, then the add
+  // rounds) for BOTH float and integer; only `fma.rn.f32` -> FMA (fused, single
+  // rounding). A prior build mapped mad.f32 -> FMA, which disagrees with the
+  // reference on fused-vs-non-fused rounding.
+  if (m == "mad")  { lowerFMA(Op::MAD, ty, s); return; }
   if (m == "fma")  { lowerFMA(Op::FMA, ty, s); return; }
 
   if (m == "add")  { lowerBinary(Op::ADD, ty, s); return; }
