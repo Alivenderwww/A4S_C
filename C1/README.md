@@ -177,21 +177,22 @@ word1 = Src2 / 指令专用字段
 word0 = Imm32 / Src3
 ```
 
-Pred/Ctrl 位域：
+Pred/Ctrl 位域（Track-B spec.md §3.2）：
 
 | 位 | 含义 |
 |---:|---|
-| 15    | 普通指令 predication enable（`BRX` 不置位，谓词直接放 2:0） |
-| 14:11 | TMUL mode 7 的扩展精度 selector |
-| 12:11 | LD/ST memory space（gmem=0,smem=1,cmem=2,lmem=3,pmem=4*） |
-| 10:8  | CMP 比较操作 / TMUL mode / tensor layout |
-| 6:3   | 数据类型 selector |
+| 15    | predication enable（`BRX` 不置位，谓词直接放 2:0） |
+| 14    | pred_neg |
+| 13:11 | LD/ST/ATOM memory space（gmem=0,smem=1,cmem=2,lmem=3,pmem=4）/ MBAR scope；CVT* 的源类型占 [13:10] |
+| 10:8  | 指令族 subop（CMP 比较码 / SHUF/VOTE mode / TMUL mode） |
+| 7     | 保留（必须 0） |
+| 6:3   | 数据类型 selector（`.none` 指令为 0xf） |
 | 2:0   | 谓词 P0–P7 |
 
-类型 selector：`f32=0 f64=1 f16=2 bf16=3 f8e4m3=4 f8e5m2=5 f4e2m1=6 s32=7 u32=8 s8=9 u8=10 s4=11 u4=12 b32=13 b64=14`。
+类型 selector（Track-B §4）：`b32=0x0 b64=0x1 u32=0x2 s32=0x3 u8=0x4 s8=0x5 f32=0x8 f64=0x9 f16=0xa bf16=0xb none=0xf`。`0x6/0x7/0xc–0xe` 保留 —— AEC 不存在 fp8/fp4/int4 标量类型。
 比较 selector：`eq=0 ne=1 lt=2 le=3 gt=4 ge=5`。
-特殊寄存器 selector（放 Src1）：`tid.x=0x100 ntid.x=0x101 ctaid.x=0x102 nctaid.x=0x103 laneid=0x104 warpid=0x105`，y/z 分量为 0x110.. / 0x120..。
-TMUL mode：`f32=0 f16=1 bf16=2 s8=3 s4=4 f8e4m3=5 f4e2m1=6`，mode 7 扩展 `f64=0 s32=1 f8e5m2=2*`。（`*` 为 C2 扩展）
+特殊寄存器 selector（放 Src1）：`tid.x=0x100 ntid.x=0x101 ctaid.x=0x102 nctaid.x=0x103 laneid=0x104`，y/z 分量为 0x110.. / 0x120..。
+CVT*：目标类型 [6:3]，源类型 [13:10]，[9:7]=0（Track-B §5.3）。
 
 常用指令形态：
 
@@ -202,17 +203,13 @@ TMUL mode：`f32=0 f16=1 bf16=2 s8=3 s4=4 f8e4m3=5 f4e2m1=6`，mode 7 扩展 `f6
 | `MAD/FMA Rd,Ra,Rb,Rc`  | Src2=Rb 在 word1，Src3=Rc 在 word0 |
 | `CMPP.cmp.type Pd,Ra,Rb` | Dest=谓词号，cmp 在 Pred/Ctrl[10:8] |
 | `BRX Pn,target`        | 谓词在 [2:0]，word0=目标绝对指令下标 |
-| `LD.gmem.type Rd,[Ra]` | Src1=地址寄存器，space 在 [12:11] |
-| `ST.gmem.type [Ra],Rs` | Dest=0，Src1=地址，Src2=源 |
-| `TLDA/TMUL/TSTA`       | tensor tile，精度 mode 在 [10:8] |
+| `LD.gmem.type Rd,[Ra]` | Src1=地址寄存器，space 在 [13:11]；`.f64` 载入用 `LD.b64` 到寄存器对 |
+| `ST.gmem.type [Ra],Rs` | Dest=0，Src1=地址，Src2=源；ST 只有 32 位，`.f64` 存储拆两条 `ST.b32` |
 
-<<<<<<< HEAD
 > golden 验证：`src/isa/encoder.cpp::selfTest()` 内置 8 条向量，取自
 > `Track-B/testcases/tests/aec_cases/cvtff/program.bin`（Track-B §A.1 编码），
-> 逐位一致，可用 `bin/aec-cc --selftest` 运行。
-=======
-> golden 验证：自检结果见 [`../docs/C1-完成度审计.md`](../docs/C1-完成度审计.md) §二；可用 `bin/aec-cc --selftest` 运行。
->>>>>>> b6e2067e59ad6291b835ed45e9b029988c256b30
+> 逐位一致，可用 `bin/aec-cc --selftest` 运行。此外 12 个自包含 Track-B
+> `aec_cases` 在 `sim/` 上执行结果与其 `expected/gmem` 逐字节一致。
 
 ---
 
@@ -234,6 +231,7 @@ TMUL mode：`f32=0 f16=1 bf16=2 s8=3 s4=4 f8e4m3=5 f4e2m1=6`，mode 7 扩展 `f6
 - 本骨架恒定输出 4 个段：`CODE / DATA / RELOC / SYMBOL`，满足 spec.md 对必备段的要求。
 - Relocation：`RELOC_PARAM_ADDR` 表示该指令的立即数是参数块字节偏移。
 - Symbol：kind=0 为 kernel 入口，kind=1 为标签（值为绝对指令下标）。
+- ⚠️ 与 spec.md 的容器要求相对，Track-B 实际用的是 **`aecbin-raw`**（裸 128-bit 指令流，无头无段；见 `Track-B/testcases/.../build.json`），设备把裸字装 IMEM、参数走 PMEM。最终提交格式（裸流 vs 本容器）待组委会确认（P0.5-A）。
 
 ---
 
