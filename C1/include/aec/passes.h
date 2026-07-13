@@ -30,7 +30,11 @@ bool licm(ir::Function &fn, const Options &opt);         // licm.cpp
 // --- Predicate optimization (scoring category T2). ------------------------
 bool predOpt(ir::Function &fn, const Options &opt);      // pred_opt.cpp
 
-// --- Loop unrolling: expose independent loads for latency hiding (T4). -----
+// --- Loop rotation: canonicalize guard-at-top while loops to do-while so the
+//     unroller can handle them (enabling transform, T5). --------------------
+bool loopRotate(ir::Function &fn, const Options &opt);   // loop_rotate.cpp
+
+// --- Loop unrolling: expose independent loads for latency hiding (T4/T5). --
 bool unrollLoops(ir::Function &fn, const Options &opt);  // unroll.cpp
 
 } // namespace passes

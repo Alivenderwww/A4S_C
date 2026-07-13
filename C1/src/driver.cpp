@@ -255,7 +255,10 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
 
   buildCFG(fn);
   runOptPasses(fn, opt);
-  if (opt.unroll) passes::unrollLoops(fn, opt);   // expose independent loads (-O3).
+  if (opt.unroll) {
+    while (passes::loopRotate(fn, opt)) {}          // while -> do-while (enables unroll)
+    passes::unrollLoops(fn, opt);                   // expose independent loads.
+  }
   sched::listSchedule(fn, opt);   // pre-RA: schedule on vregs (fewer false deps).
   const uint64_t estCycles = estimateCyclesIR(fn);   // pre-RA: vregs unique.
   regalloc::linearScan(fn, opt);
