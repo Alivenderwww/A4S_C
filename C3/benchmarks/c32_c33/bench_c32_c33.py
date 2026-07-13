@@ -39,7 +39,7 @@ from runtime.mock_runtime import MockRuntime
 
 # public-model locations (relative to repo)
 _MODELS_DIR = os.path.join(
-    _C3_ROOT, "..", "public", "Track-C", "C3-scheduler",
+    _C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest", "Track-C", "C3-scheduler",
     "testcases", "release_to_competitors", "models",
 )
 MODEL_FILES = {
@@ -172,8 +172,16 @@ def score_c33(graph, model_key):
     opt = pipe.optimized_graph
 
     # ---- F1 ----
+    # Only the five canonical patterns in spec.md §F1 count toward the score.
+    # Non-canonical fusion names (e.g. an activation fold reported as
+    # 'FusedConvRelu') still earn F2/F3 through launch/buffer reduction but do
+    # NOT inflate F1 — they are reported for transparency only.
+    CANONICAL_PATTERNS = {
+        "FusedMatMulBias", "FusedConv2dBatchNorm", "FusedEWChain",
+        "FusedSoftmaxDropout", "FusedResidualNorm",
+    }
     patterns_hit = set(stats["patterns_hit"])
-    F1 = float(len(patterns_hit))  # 1 point each, max 5
+    F1 = float(len(patterns_hit & CANONICAL_PATTERNS))  # 1 pt each, max 5
 
     # ---- F2 ----
     rl, ol = stats["raw_launches"], stats["opt_launches"]
@@ -229,6 +237,46 @@ def _numeric_align(graph, opt, model_key):
 
 
 # ===================================================================== main
+def _write_report(output_dir: str, all_scores: dict) -> None:
+    """Write BENCHMARK_REPORT.md — the human-readable overview spec.md requires."""
+    lines = ["# C3.2 / C3.3 Benchmark Report\n"]
+    lines.append("评审可读总览。每个算子的分解 + tuning + 中间张量明细见 `bench_<model>.json`；"
+                 "合并最终分见 `scores.json`。\n")
+
+    grader_models = all_scores.get("_summary", {}).get("grader_models", [])
+    for key, sc in all_scores.items():
+        if key.startswith("_") or not isinstance(sc, dict):
+            continue
+        c32, c33 = sc["c32"], sc["c33"]
+        tag = " *(official grader)*" if key in grader_models else ""
+        lines.append(f"## {key}{tag}\n")
+        lines.append(f"**C3.2 = {c32['total']}/15**  "
+                     f"(D1={c32['D1']} D2={c32['D2']} D3={c32['D3']} D4={c32['D4']} D5={c32['D5']})\n")
+        lines.append(f"- precisions seen: {c32['precisions_seen']}")
+        lines.append(f"- GEMM kernels: {c32['gemm_kernels']}")
+        lines.append(f"- Conv strategy: im2col={c32['conv_im2col']} winograd={c32['conv_winograd']}\n")
+        lines.append(f"**C3.3 = {c33['total']}/15**  "
+                     f"(F1={c33['F1']} F2={c33['F2']} F3={c33['F3']} F4={c33['F4']})\n")
+        rl, ol = c33["launches"]
+        rb, ob = c33["buffers"]
+        lines.append(f"- patterns hit: {c33['patterns_hit']}")
+        lines.append(f"- launches: {rl} -> {ol}")
+        lines.append(f"- buffers: {rb} -> {ob}")
+        lines.append(f"- numeric alignment: {c33['numeric_align']} (max_abs_diff={c33['max_abs_diff']})\n")
+
+    summ = all_scores.get("_summary")
+    if summ:
+        total = summ.get("c32_avg", 0) + summ.get("c33_avg", 0)
+        lines.append("## Summary (official grader models)\n")
+        lines.append(f"- models: {summ.get('grader_models')}")
+        lines.append(f"- C3.2 avg: {summ.get('c32_avg')}/15")
+        lines.append(f"- C3.3 avg: {summ.get('c33_avg')}/15")
+        lines.append(f"- **C3.2 + C3.3 = {round(total, 2)}/30**\n")
+
+    with open(os.path.join(output_dir, "BENCHMARK_REPORT.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="+", default=["mnist_mlp", "cifar_resnet18", "transformer"])
@@ -269,6 +317,7 @@ def main(argv=None) -> int:
         }
     with open(os.path.join(args.output_dir, "scores.json"), "w", encoding="utf-8") as f:
         json.dump(all_scores, f, indent=2)
+    _write_report(args.output_dir, all_scores)
     return 0
 
 

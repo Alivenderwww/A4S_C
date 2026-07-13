@@ -28,7 +28,7 @@ from scheduler.graph import import_onnx_graph
 from tools import export_dag, infer
 
 _PUBLIC = os.path.normpath(os.path.join(
-    _C3_ROOT, "..", "public", "Track-C", "C3-scheduler",
+    _C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest", "Track-C", "C3-scheduler",
     "testcases", "release_to_competitors",
 ))
 _MODELS = os.path.join(_PUBLIC, "models")

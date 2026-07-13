@@ -117,6 +117,15 @@ def op_Split(x, split=None, axis=0, num_outputs=None, **_):
     return np.split(x, n, axis=axis)
 
 
+def op_BatchNormalization(x, scale, bias, mean, var, epsilon=1e-5, **_):
+    """Inference-mode BatchNorm: per-channel affine over the channel axis (1)."""
+    scale = np.asarray(scale, dtype=x.dtype).reshape(1, -1, *([1] * (x.ndim - 2)))
+    bias = np.asarray(bias, dtype=x.dtype).reshape(1, -1, *([1] * (x.ndim - 2)))
+    mean = np.asarray(mean, dtype=x.dtype).reshape(1, -1, *([1] * (x.ndim - 2)))
+    var = np.asarray(var, dtype=x.dtype).reshape(1, -1, *([1] * (x.ndim - 2)))
+    return scale * (x - mean) / np.sqrt(var + epsilon) + bias
+
+
 def op_GlobalAveragePool(x, **_):
     axes = tuple(range(2, x.ndim))
     return np.mean(x, axis=axes, keepdims=True)

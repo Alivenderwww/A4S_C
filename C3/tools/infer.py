@@ -115,10 +115,56 @@ class _ReferenceBackend:
         return dict(zip(self.output_names, outs))
 
 
-def _make_backend(onnx_path: str):
+class _CupyBackend:
+    """CuPy GPU backend — the spec-required numerical library (手写算子).
+
+    Loads the ONNX graph via ``scheduler.import_onnx_graph`` and executes it on
+    the GPU with :class:`runtime.cupy_runtime.CupyRuntime`, which runs every
+    operator via :mod:`runtime.ops_cupy`. Weights upload once; each batch's
+    inputs upload, run, and download.
+    """
+
+    def __init__(self, onnx_path: str):
+        # import lazily so the (heavy) CuPy import only happens when this backend
+        # is actually selected — keeps ORT-only runs cheap.
+        import sys as _sys
+        _root = _C3_ROOT
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
+        from scheduler import import_onnx_graph
+        from runtime.cupy_runtime import CupyRuntime
+
+        self.graph = import_onnx_graph(onnx_path)
+        self.rt = CupyRuntime(self.graph)
+        self.output_names = [t.name for t in self.graph.outputs]
+        # dtype per input, mirroring _OrtBackend (used to cast feed tensors)
+        from scheduler.graph import _dtype_name  # noqa: F401  (kept for parity)
+        self.input_dtypes = {t.name: _ORT_TYPE_TO_NP.get(
+            "tensor(" + t.dtype.lower() + ")", np.float32) for t in self.graph.inputs}
+        self.providers = ["CuPy"]
+
+    def run(self, feed):
+        feed = {k: np.ascontiguousarray(v, dtype=self.input_dtypes.get(k, v.dtype))
+                for k, v in feed.items()}
+        return self.rt.run(feed)
+
+
+def _make_backend(onnx_path: str, backend_name: str = "cupy"):
+    """Select the inference backend.
+
+    Order: CuPy (spec-required default) -> onnxruntime -> ReferenceEvaluator.
+    Pass ``backend_name="ort"`` to force onnxruntime.
+    """
+    if backend_name != "ort":
+        try:
+            backend = _CupyBackend(onnx_path)
+            print(f"[infer] backend: CuPy GPU")
+            return backend
+        except Exception as exc:
+            print(f"[infer] CuPy unavailable ({exc}); falling back", file=sys.stderr)
     try:
         backend = _OrtBackend(onnx_path)
-        print(f"[infer] onnxruntime providers: {backend.providers}")
+        print(f"[infer] backend: onnxruntime ({backend.providers})")
         return backend
     except Exception as exc:
         print(f"[infer] onnxruntime unavailable ({exc}); using ReferenceEvaluator", file=sys.stderr)
@@ -132,10 +178,12 @@ def main(argv=None) -> int:
     ap.add_argument("--input", required=True, help="input dir with manifest.json + .npy")
     ap.add_argument("--output", required=True, help="output dir")
     ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--backend", default="cupy", choices=["cupy", "ort"],
+                    help="inference backend: cupy (default, GPU) or ort")
     args = ap.parse_args(argv)
 
     inputs, n = _load_inputs(args.input)
-    backend = _make_backend(args.onnx)
+    backend = _make_backend(args.onnx, backend_name=args.backend)
 
     bs = args.batch_size if args.batch_size and args.batch_size > 0 else n
     bs = max(1, bs)
