@@ -46,15 +46,29 @@ struct Options {
   bool lenient      = false;  // keep going past unhandled PTX ops (default: fail).
 
   // Derive the boolean pass switches from an -O level.
+  //
+  // CORRECTNESS FIRST AT EVERY LEVEL. Two transforms are AEC semantic
+  // requirements, not optimizations, so they stay ON even at -O0:
+  //   gemm_tmul : GEMM idiom lowering -- must run to emit a matmul at all.
+  //   pred_opt  : if-convert divergent bounds guards. AEC has no SIMT
+  //               reconvergence, so a divergent BRX is a WRONG RESULT (not just
+  //               slow); a partial last block (N % blockDim != 0) would fault.
+  //               Gating this off at -O0 made -O0 miscompile -> instant zero.
+  // Everything else below is a pure performance choice:
+  //   -O0 = correct standard codegen (perf opts off)
+  //   -O2 = default: all safe perf opts on (earns the bulk of the perf score)
+  //   -O3 = aggressive: adds opts that don't fit every PTX (unroll, wider
+  //         window) but MUST remain correct.
   void applyOptLevel(OptLevel level) {
     opt = level;
-    const bool on = (level != OptLevel::O0);
-    const_prop = dce = cse = on;
-    licm = mem_coalesce = pred_opt = on;
-    dual_issue = on;
-    gemm_tmul  = true;                 // lowering correctness, always on.
+    gemm_tmul  = true;                 // correctness: always on.
+    pred_opt   = true;                 // correctness: always on (see above).
+    const bool o2 = (level != OptLevel::O0);   // O2/O3 performance opts.
+    const_prop = dce = cse = o2;
+    licm = mem_coalesce = o2;
+    dual_issue = o2;
+    unroll = (level == OptLevel::O3);  // aggressive: opt-in at -O3 only.
     sched_window = (level == OptLevel::O3) ? 32 : 16;
-    unroll = (level == OptLevel::O3);  // unrolling is opt-in at -O3 only.
   }
 };
 

@@ -52,8 +52,13 @@ uint32_t paramBlockBytes(const ir::Function &fn) {
 }
 
 void runOptPasses(ir::Function &fn, const Options &opt) {
-  if (opt.opt == OptLevel::O0) return;
-  // Two light rounds so an implemented pass can feed the next (identity now).
+  // NOTE: do NOT early-return on -O0. The performance passes are each gated by
+  // their own flag (all false at -O0, so this is a no-op there), but pred_opt
+  // is a CORRECTNESS transform that must run at every level -- see
+  // Options::applyOptLevel. A blanket `if (O0) return;` here previously skipped
+  // it and made -O0 miscompile divergent bounds guards.
+  //
+  // Two light rounds so an implemented pass can feed the next.
   for (int round = 0; round < 2; ++round) {
     if (opt.const_prop) passes::constProp(fn, opt);
     if (opt.cse)        passes::cse(fn, opt);
@@ -61,7 +66,7 @@ void runOptPasses(ir::Function &fn, const Options &opt) {
     if (opt.dce)        passes::dce(fn, opt);
   }
   if (opt.mem_coalesce) passes::memCoalesce(fn, opt);
-  if (opt.pred_opt)     passes::predOpt(fn, opt);
+  if (opt.pred_opt)     passes::predOpt(fn, opt);   // correctness: every level.
   buildCFG(fn); // transforms may have changed control flow.
 }
 
