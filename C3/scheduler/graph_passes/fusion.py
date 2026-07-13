@@ -220,16 +220,26 @@ class FusionPass:
         return out
 
     def _match_residual_norm(self, g: Graph, consumed: Set[str], groups: List):
+        """Fuse ``skip-Add → LayerNorm`` (FusedResidualNorm, spec canonical).
+
+        A residual block feeds the skip-Add's output into *both* a LayerNorm
+        and the next block's residual path, so the Add has ≥2 consumers. The
+        old ``len(succ) == 1`` guard skipped every such case (transformer had 9
+        Add→LN pairs but fused only 1). Here we fuse whenever one of the Add's
+        successors is a LayerNorm and the Add is a genuine residual (≥2
+        non-initializer inputs). ``_apply_groups`` keeps the Add's output as an
+        external output for the other consumer, so the branch stays live.
+        """
         consumers = g.consumer_map()
         for n in g.nodes:
             if n.name in consumed or n.op_type != "Add":
                 continue
             out = n.outputs[0]
             succ = [c for c in consumers.get(out, []) if c.name not in consumed]
-            if len(succ) != 1:
-                continue
-            ln = succ[0]
-            if ln.op_type not in ("LayerNormalization", "LayerNorm"):
+            # LN must be one of the Add's consumers (not necessarily the only one)
+            ln = next((c for c in succ
+                       if c.op_type in ("LayerNormalization", "LayerNorm")), None)
+            if ln is None:
                 continue
             # residual add: neither input is a bias-only initializer
             non_init = [t for t in n.inputs if t not in g.initializer_names]
