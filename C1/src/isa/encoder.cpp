@@ -47,9 +47,10 @@ Word128 encode(const Fields &f) {
       (static_cast<uint16_t>(ty) & kTypeMask) << kTypeShift);
 
   if (f.op == Op::BRX) {
-    // BRX always names its branch predicate in bits [2:0], no enable bit; a
-    // `@!%p bra` (branch-when-false) sets pred_neg in [14].
-    pred_ctrl |= static_cast<uint16_t>(f.predicate & 0x7u);
+    // BRX branches on the predicate in bits [2:0]; the CModel requires the
+    // predicate-enable bit [15] set to recognize it (else "BRX requires
+    // predicate"). A `@!%p bra` (branch-when-false) sets pred_neg in [14].
+    pred_ctrl |= kPredEnable | static_cast<uint16_t>(f.predicate & 0x7u);
   } else if (f.predicate != kPredicateNone) {
     pred_ctrl |= kPredEnable | static_cast<uint16_t>(f.predicate & 0x7u);
   }
