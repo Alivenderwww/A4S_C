@@ -9,12 +9,15 @@ Pattern status
 --------------
 IMPLEMENTED (fire on the public models):
   * ``FusedMatMulBias``     -- MatMul -> Add(bias)         [transformer]
-                              + Gemm(A,W,b) recognised as the pre-fused form [mlp, resnet]
+                              + Gemm(A,W,b) canonicalised   [mlp, resnet]
   * ``FusedResidualNorm``   -- skip-Add -> LayerNorm       [transformer]
   * ``FusedEWChain``        -- 2..5 adjacent elementwise    [transformer GELU, resnet Add->Relu]
-  * activation fold         -- Conv/Gemm/MatMul -> Act      [resnet Conv->Relu, mlp Gemm->Relu]
+  * activation fold         -- Conv/Gemm/MatMul -> Act      [resnet Conv->Relu]
                               reported as ``FusedConvRelu`` (not a spec pattern; earns F2/F3
                               only, never inflates F1)
+  * MLP supernode           -- Flatten?->Gemm(bias)->Relu?   [mlp]
+                              reported as ``FusedGemmAct`` (non-canonical; the embedded
+                              Add->Relu tail is separately annotated as FusedEWChain)
 
 MATCHER PRESENT, does not fire on current public models (documented TODO):
   * ``FusedSoftmaxDropout`` -- Softmax -> Dropout           (inference graph has no Dropout)
@@ -71,6 +74,43 @@ def _count_buffers(graph: Graph) -> int:
     return len({e["tensor"] for e in graph.edges})
 
 
+class _UniqueNameAlloc:
+    """Deterministic collision-free name allocator for generated nodes/tensors.
+
+    Pre-populates the reservation set from the entire graph (initializer names,
+    input/output tensor names, node names, all tensor references) so that
+    replay-op names, intermediate tensors, and new initializer names never
+    collide with existing graph symbols or with each other.
+    """
+
+    def __init__(self, graph: Graph) -> None:
+        self._used: Set[str] = set()
+        self._used.update(graph.initializer_names)
+        self._used.update(graph.input_names())
+        self._used.update(graph.output_names())
+        for n in graph.nodes:
+            self._used.add(n.name)
+            for t in n.inputs:
+                if t:
+                    self._used.add(t)
+            for t in n.outputs:
+                if t:
+                    self._used.add(t)
+
+    def fresh(self, base: str) -> str:
+        """Return *base* if unused, otherwise *base*_N with minimal N."""
+        if base not in self._used:
+            self._used.add(base)
+            return base
+        i = 1
+        while True:
+            cand = f"{base}_{i}"
+            if cand not in self._used:
+                self._used.add(cand)
+                return cand
+            i += 1
+
+
 class FusionPass:
     name = "Fusion"
 
@@ -88,6 +128,7 @@ class FusionPass:
             return self._stats(opt, fusion_log, raw_launches, raw_buffers)
 
         work = graph.clone()
+        alloc = _UniqueNameAlloc(work)
         # Priority order matters: bias/residual/EW-chain before the (dormant)
         # softmax/conv-bn matchers.  Each pattern skips already-consumed nodes.
         consumed: Set[str] = set()
@@ -96,13 +137,23 @@ class FusionPass:
         for matcher in (
             self._match_matmul_bias,
             self._match_residual_norm,
+            lambda g, c, gr: self._match_mlp_structure(g, c, gr, alloc),  # alloc-aware
             self._match_softmax_dropout,
             self._match_conv_bn,
+            self._match_pool_flatten,
+            self._match_dual_conv_residual_add,
             self._match_conv_residual_add,
             self._match_ew_chain,
             self._match_compute_activation,
         ):
             matcher(work, consumed, groups)
+
+        # Deduplicate fused_names: the allocator already protects generated
+        # tensor/initializer names, but fused_name (used as the fused Node
+        # name) is set in each group's dict and may collide with existing
+        # node/tensor/initializer names or with another group's fused_name.
+        for g in groups:
+            g["fused_name"] = alloc.fresh(g["fused_name"])
 
         opt = self._apply_groups(work, groups)
         for g in groups:
@@ -137,13 +188,18 @@ class FusionPass:
         graph — the chain's launches/buffers are already counted as eliminated
         by the enclosing fusion. Honest: the log entry is flagged ``annotation``
         and points at the enclosing fused node.
+
+        When a group carries ``replay_ops`` (e.g. Gemm → MatMul+Add canonicalization),
+        the EW chain is detected from the replay ops (which show the actual fused
+        semantics) rather than the original graph nodes (whose op_types may not
+        reflect the replay structure).
         """
         out: List[Dict[str, Any]] = []
         for grp in groups:
-            members = grp["nodes"]
-            # extract the maximal trailing run of elementwise ops in this group
+            use_ops = grp.get("replay_ops", grp["nodes"])
+            # extract the maximal trailing run of elementwise ops
             ew_tail: List[Node] = []
-            for m in members:
+            for m in use_ops:
                 if m.op_type in _ELEMENTWISE:
                     ew_tail.append(m)
                 else:
@@ -211,6 +267,9 @@ class FusionPass:
                 continue
             if len(n.inputs) < 3 or not n.inputs[2]:
                 continue  # no bias -> pure MatMul semantics, skip
+            alpha = float(n.attrs.get("alpha", 1.0))
+            if alpha != 1.0:
+                continue  # non-default alpha → not strict MatMul+Add semantics
             out.append({
                 "pattern": "FusedMatMulBias",
                 "nodes": [n.name],
@@ -218,6 +277,179 @@ class FusionPass:
                 "annotation": "Gemm(bias) recognised as pre-fused MatMul+AddBias",
             })
         return out
+
+    def _canonicalize_gemm_replay(self, g: Graph, gemm: Node,
+                                   alloc: _UniqueNameAlloc,
+                                   ) -> Optional[tuple]:
+        """Build replay ops [MatMul, Add] for a biased Gemm, plus new initializers.
+
+        Returns ``(replay_ops, extra_initializers)`` or ``None`` when the Gemm
+        cannot be canonicalised into strict ``[MatMul, Add]`` (e.g. transA!=0
+        would need a dynamic Transpose, breaking the exact 2-op contract).
+
+        The new weight initializer absorbs ``alpha`` and ``transB``.
+        The new bias initializer absorbs ``beta``.
+        Original initializers are never mutated.
+        All generated names are collision-free via *alloc*.
+        """
+        attrs = gemm.attrs
+        transA = int(attrs.get("transA", 0))
+        if transA != 0:
+            return None  # would need Transpose in replay → not strict canonical
+        alpha = float(attrs.get("alpha", 1.0))
+        if alpha != 1.0:
+            return None  # FP16-safe: only strict [MatMul,Add] when alpha == 1.0
+        beta = float(attrs.get("beta", 1.0))
+        transB = int(attrs.get("transB", 0))
+
+        if len(gemm.inputs) < 3 or not gemm.inputs[2]:
+            return None  # no bias
+        b_name = gemm.inputs[1]
+        c_name = gemm.inputs[2]
+        init = g.initializers
+        if b_name not in init or c_name not in init:
+            return None
+        if init[b_name] is None or init[c_name] is None:
+            return None
+
+        # B_new = alpha * transB(B)
+        b_val = np.asarray(init[b_name])
+        if transB:
+            b_val = b_val.swapaxes(-1, -2)
+        b_new = (alpha * b_val).astype(b_val.dtype)
+
+        # bias_new = beta * C
+        c_val = np.asarray(init[c_name])
+        bias_new = (beta * c_val).astype(c_val.dtype)
+
+        new_b_name = alloc.fresh(f"{gemm.name}.B_fused")
+        new_c_name = alloc.fresh(f"{gemm.name}.C_fused")
+
+        mm_out = alloc.fresh(f"{gemm.name}.mm_out")
+        matmul_op = Node(
+            name=alloc.fresh(f"{gemm.name}.rp_mm"),
+            op_type="MatMul",
+            inputs=[gemm.inputs[0], new_b_name],
+            outputs=[mm_out],
+        )
+        add_op = Node(
+            name=alloc.fresh(f"{gemm.name}.rp_add"),
+            op_type="Add",
+            inputs=[mm_out, new_c_name],
+            outputs=list(gemm.outputs),
+        )
+        return [matmul_op, add_op], {new_b_name: b_new, new_c_name: bias_new}
+
+    def _match_mlp_structure(self, g: Graph, consumed: Set[str], groups: List,
+                              alloc: _UniqueNameAlloc):
+        """Match MLP graph structure: Flatten→Gemm(bias)→Relu / Gemm(bias)→Relu / standalone Gemm.
+
+        Three cases (all require biased Gemm with canonicalisable attrs):
+
+        1. ``Flatten → Gemm(bias) → Relu`` → supernode, replay [Flatten, MatMul, Add, Relu]
+        2. ``Gemm(bias) → Relu`` → supernode, replay [MatMul, Add, Relu]
+        3. ``Gemm(bias)`` (standalone) → strict ``FusedMatMulBias``, replay [MatMul, Add]
+
+        Cases 1-2 report non-canonical pattern ``FusedGemmAct``; their embedded
+        ``Add→Relu`` is separately annotated as ``FusedEWChain`` (canonical) via
+        ``_annotate_embedded_ewchains``.
+        Case 3 reports canonical ``FusedMatMulBias``.
+
+        Flatten is absorbed **only** when both a Relu follows AND the Flatten
+        output has exactly one consumer (the target Gemm).  A standalone
+        Flatten→Gemm(bias) without Relu keeps the Flatten as a separate node
+        and the Gemm is reported as FusedMatMulBias.
+
+        Driven entirely by graph topology — never hardcodes model/op names.
+        All generated names are collision-free via *alloc*.
+        """
+        producers = g.producer_map()
+        consumers = g.consumer_map()
+
+        for n in list(g.nodes):  # iterate over snapshot; consumed set gates re-entry
+            if n.name in consumed or n.op_type != "Gemm":
+                continue
+            if len(n.inputs) < 3 or not n.inputs[2]:
+                continue  # no bias → pure MatMul, skip
+
+            replay_result = self._canonicalize_gemm_replay(g, n, alloc)
+            if replay_result is None:
+                continue  # transA!=0 or missing initializers → fallback to annotation
+            base_replay, extra_inits = replay_result
+
+            # Check for preceding Flatten or similar reshape
+            pred = None
+            for t in n.inputs:
+                if t in g.initializer_names:
+                    continue
+                src = producers.get(t)
+                if src is not None and src.name not in consumed:
+                    pred = src
+                    break
+
+            has_flatten = (pred is not None
+                           and pred.op_type == "Flatten"
+                           and pred.name not in consumed)
+
+            # Single-consumer guard for Flatten: only absorb when the Flatten
+            # output feeds exactly one node (the target Gemm).
+            # NOTE: must check ALL original consumers, not just unconsumed ones.
+            # A bypass consumer consumed by an earlier matcher (e.g.
+            # _match_residual_norm) would otherwise make the Flatten appear to
+            # have only 1 consumer, causing a wrongful absorption.
+            if has_flatten and pred is not None:
+                flat_consumers = [c for c in consumers.get(pred.outputs[0], [])]
+                if len(flat_consumers) != 1:
+                    has_flatten = False
+
+            # Check for succeeding Relu
+            out = n.outputs[0]
+            succ = [c for c in consumers.get(out, []) if c.name not in consumed]
+            has_relu = len(succ) == 1 and succ[0].op_type == "Relu"
+
+            members = [n]
+            replay = list(base_replay)  # copy
+
+            # Flatten absorbed only when both Flatten AND Relu present
+            if has_flatten and has_relu and pred is not None:
+                members.insert(0, pred)
+                # Prefix a Flatten replay op with collision-free names
+                flat_out = alloc.fresh(f"{n.name}.rp_flat")
+                flat_op = Node(
+                    name=alloc.fresh(f"{pred.name}.rp_flat"),
+                    op_type="Flatten",
+                    inputs=list(pred.inputs),
+                    outputs=[flat_out],
+                    attrs=dict(pred.attrs),
+                )
+                replay.insert(0, flat_op)
+                # Wire first MatMul input to flat output
+                replay[1].inputs[0] = flat_out
+
+            if has_relu:
+                members.append(succ[0])
+                # Append a Relu replay op
+                relu_op = Node(
+                    name=alloc.fresh(f"{succ[0].name}.rp_relu"),
+                    op_type="Relu",
+                    inputs=[replay[-1].outputs[0]],
+                    outputs=list(succ[0].outputs),
+                )
+                replay.append(relu_op)
+
+            if has_relu:
+                pattern_name = "FusedGemmAct"  # non-canonical; F1 via embedded EW
+            else:
+                pattern_name = "FusedMatMulBias"  # canonical
+
+            groups.append({
+                "pattern": pattern_name,
+                "nodes": members,
+                "fused_name": f"{pattern_name}::{n.name}",
+                "replay_ops": replay,
+                "extra_initializers": extra_inits,
+            })
+            consumed.update({m.name for m in members})
 
     def _match_residual_norm(self, g: Graph, consumed: Set[str], groups: List):
         """Fuse ``skip-Add → LayerNorm`` (FusedResidualNorm, spec canonical).
@@ -260,16 +492,145 @@ class FusionPass:
                 consumed.update({n.name, succ[0].name})
 
     def _match_conv_bn(self, g: Graph, consumed: Set[str], groups: List):
-        # Dormant on the public ResNet (no BN nodes). See PRE_FUSION_TODO.
+        """Fuse ``Conv → BatchNormalization/BatchNorm`` (FusedConv2dBatchNorm, spec canonical).
+
+        Strict safety guards:
+          * Conv weight must be an initializer (never dynamic).
+          * Conv output must have exactly one consumer (the target BN) — uses ALL
+            original consumers, unfiltered by consumed status.
+          * Conv output must not be a graph output.
+          * BN must have exactly 5 inputs (x, scale, bias, mean, var) and all four
+            affine parameters must be initializers.
+          * If BN has extra outputs beyond the first (e.g. saved_mean, saved_var),
+            none may be a graph output or have any consumer — the extra output is
+            internal to the BN kernel.
+          * Target BN node must not already be *consumed* by an earlier matcher.
+        """
         consumers = g.consumer_map()
+        graph_outs = g.output_names()
+        init_names = g.initializer_names
         for n in g.nodes:
             if n.name in consumed or n.op_type != "Conv":
                 continue
+            # Conv weight must be an initializer (not a dynamic input)
+            if len(n.inputs) < 2 or n.inputs[1] not in init_names:
+                continue
             out = n.outputs[0]
-            succ = [c for c in consumers.get(out, []) if c.name not in consumed]
-            if len(succ) == 1 and succ[0].op_type in ("BatchNormalization", "BatchNorm"):
-                groups.append(self._make_group("FusedConv2dBatchNorm", [n, succ[0]]))
+            # Conv output must not be a graph output
+            if out in graph_outs:
+                continue
+            # Conv output must have exactly one consumer — check ALL original
+            # consumers without filtering by consumed status.
+            all_conv_consumers = consumers.get(out, [])
+            if len(all_conv_consumers) != 1:
+                continue
+            bn = all_conv_consumers[0]
+            if bn.op_type not in ("BatchNormalization", "BatchNorm"):
+                continue
+            if bn.name in consumed:
+                continue
+            # BN must have exactly 5 inputs: x, scale, bias, mean, var
+            if len(bn.inputs) != 5:
+                continue
+            # scale, bias, mean, var must all be initializers
+            if any(inp not in init_names for inp in bn.inputs[1:5]):
+                continue
+            # BN extra outputs must not be graph outputs or have consumers
+            if len(bn.outputs) > 1:
+                extra_outputs = bn.outputs[1:]
+                if any(o in graph_outs for o in extra_outputs):
+                    continue
+                if any(len(consumers.get(o, [])) > 0 for o in extra_outputs):
+                    continue
+
+            groups.append(self._make_group("FusedConv2dBatchNorm", [n, bn]))
+            consumed.update({n.name, bn.name})
+
+    def _match_pool_flatten(self, g: Graph, consumed: Set[str], groups: List):
+        """Fuse ``GlobalAveragePool → Flatten`` when Pool output has exactly one
+        consumer (the Flatten) and is not a graph output.
+
+        Reports as non-canonical ``FusedPoolFlatten``.
+        """
+        consumers = g.consumer_map()
+        graph_outs = g.output_names()
+        for n in g.nodes:
+            if n.name in consumed or n.op_type != "GlobalAveragePool":
+                continue
+            out = n.outputs[0]
+            if out in graph_outs:
+                continue
+            succ = consumers.get(out, [])
+            if len(succ) == 1 and succ[0].op_type == "Flatten" and succ[0].name not in consumed:
+                groups.append({
+                    "pattern": "FusedPoolFlatten",
+                    "nodes": [n, succ[0]],
+                    "fused_name": f"FusedPoolFlatten::{n.name}",
+                })
                 consumed.update({n.name, succ[0].name})
+
+    def _match_dual_conv_residual_add(self, g: Graph, consumed: Set[str], groups: List):
+        """Fuse two Convs whose outputs both feed the same Add, plus optional
+        trailing unary activation (``Conv1, Conv2 → Add → [Relu]``).
+
+        Each Conv output must be consumed *only* by the target Add (no bypass
+        consumers).  When a single unary activation follows the Add it is absorbed
+        too.  Members are emitted in topological order.
+
+        Must run before ``_match_conv_residual_add`` so a dual-Conv residual is not
+        broken by the single-Conv matcher stealing one Conv + Add.
+
+        Reports as non-canonical ``FusedDualConvResidualAdd``.
+        """
+        producers = g.producer_map()
+        consumers = g.consumer_map()
+        node_order = {n.name: i for i, n in enumerate(g.nodes)}
+
+        for add in g.nodes:
+            if add.name in consumed or add.op_type != "Add":
+                continue
+
+            # Parse the Add's data inputs (skip initializers — those are bias)
+            conv_inputs: List[Node] = []
+            for t in add.inputs:
+                if t in g.initializer_names:
+                    continue  # bias input — not a residual path
+                src = producers.get(t)
+                if src is None or src.name in consumed or src.op_type != "Conv":
+                    conv_inputs.clear()
+                    break
+                # Conv output must be consumed ONLY by this Add (original graph)
+                conv_out = src.outputs[0]
+                all_cons = consumers.get(conv_out, [])  # ALL original consumers
+                if len(all_cons) != 1 or all_cons[0].name != add.name:
+                    conv_inputs.clear()
+                    break
+                conv_inputs.append(src)
+
+            if len(conv_inputs) != 2:
+                continue
+
+            # Topological order by original node position
+            conv_inputs.sort(key=lambda c: node_order[c.name])
+            members: List[Node] = list(conv_inputs)
+            members.append(add)
+
+            # Absorb a single trailing Relu only — based on ALL original consumers
+            # without filtering by consumed status (Task 5 spec).  Only when
+            # total consumers == 1 and that consumer is Relu: Erf/Sqrt are left
+            # as standalone nodes so they can be fused by _match_ew_chain or
+            # other matchers.
+            add_out = add.outputs[0]
+            all_cons = consumers.get(add_out, [])
+            if len(all_cons) == 1 and all_cons[0].op_type == "Relu":
+                members.append(all_cons[0])
+
+            groups.append({
+                "pattern": "FusedDualConvResidualAdd",
+                "nodes": members,
+                "fused_name": f"FusedDualConvResidualAdd::{add.name}",
+            })
+            consumed.update({m.name for m in members})
 
     def _match_conv_residual_add(self, g: Graph, consumed: Set[str], groups: List):
         """Fuse ``Conv → Add(residual)`` and, when present, the trailing ``→ Relu``.
@@ -390,7 +751,16 @@ class FusionPass:
         }
 
     def _apply_groups(self, g: Graph, groups: List[Dict[str, Any]]) -> Graph:
-        """Build the optimized graph, replacing each group with one fused node."""
+        """Build the optimized graph, replacing each group with one fused node.
+
+        Each group may carry an optional ``replay_ops`` key — when present the
+        fused node's ``fused_ops`` are taken from ``replay_ops`` (which describe
+        the canonicalised semantics, e.g. Gemm→[MatMul,Add]) rather than from
+        the original graph members. ``extra_initializers`` are merged into the
+        output graph so the replay ops can reference freshly-created weights.
+        External inputs/outputs are always computed from the original *members*
+        (``grp["nodes"]``) for correct graph topology.
+        """
         # map every consumed node name -> its group index (position of fused node)
         name_to_group: Dict[str, int] = {}
         for gi, grp in enumerate(groups):
@@ -401,14 +771,25 @@ class FusionPass:
         graph_outs = g.output_names()
         consumers = g.consumer_map()
 
+        # Collect extra initializers from groups that carry them
+        extra_inits: Dict[str, np.ndarray] = {}
+        for grp in groups:
+            for k, v in grp.get("extra_initializers", {}).items():
+                extra_inits[k] = v
+
         fused_nodes: Dict[int, Node] = {}
         for gi, grp in enumerate(groups):
             members = grp["nodes"]
             member_names = {n.name for n in members}
-            produced_within: Set[str] = {o for n in members for o in n.outputs}
+            # When replay_ops are present, derive ext_inputs from replay ops so
+            # the fused node exposes the actual tensor dependencies (e.g.
+            # generated B_fused/C_fused instead of the original W/C).  Otherwise
+            # fall back to original members.
+            src_for_inputs = grp.get("replay_ops", members)
+            produced_within: Set[str] = {o for m in src_for_inputs for o in m.outputs}
             ext_inputs: List[str] = []
-            for n in members:
-                for t in n.inputs:
+            for m in src_for_inputs:
+                for t in m.inputs:
                     if t not in produced_within and t not in ext_inputs:
                         ext_inputs.append(t)
             ext_outputs: List[str] = []
@@ -422,13 +803,19 @@ class FusionPass:
                             ext_outputs.append(o)
             if not ext_outputs:  # fall back to last node's outputs
                 ext_outputs = list(members[-1].outputs)
+
+            # Use replay_ops (e.g. [MatMul, Add] canonicalised from Gemm) when
+            # present; otherwise fall back to original members.
+            src_ops = grp.get("replay_ops", None)
+            fused_ops = [m.clone() for m in src_ops] if src_ops else [m.clone() for m in members]
+
             fused_nodes[gi] = Node(
                 name=grp["fused_name"],
                 op_type=grp["pattern"],
                 inputs=ext_inputs,
                 outputs=ext_outputs,
                 attrs={"fused": True, "pattern": grp["pattern"]},
-                fused_ops=[m.clone() for m in members],
+                fused_ops=fused_ops,
             )
 
         # Rebuild node list in original order, emitting the fused node at the
@@ -444,12 +831,14 @@ class FusionPass:
                 emitted.add(gi)
             # else: drop (already represented by the fused node)
 
+        all_inits = dict(g.initializers)
+        all_inits.update(extra_inits)
         opt = Graph(
             name=g.name + "_fused",
             nodes=new_nodes,
             inputs=[t for t in g.inputs],
             outputs=[t for t in g.outputs],
-            initializers=dict(g.initializers),
+            initializers=all_inits,
         )
         return opt
 
@@ -458,101 +847,15 @@ class FusionPass:
 
 
 # ---------------------------------------------------------------------------
-# Pre-fusion: recognise the Conv+BatchNorm fusion so FusedConv2dBatchNorm can
-# be credited even when BN was absorbed into the Conv weights at export time
-# (the public ResNet-18 case - spec C3.3 F1 note).
+# Pre-fusion Conv-BN recognition (DEPRECATED — kept as public no-op for import
+# compatibility).  Conv-BN fusion is handled entirely by
+# ``FusionPass._match_conv_bn`` with strict safety guards.
 # ---------------------------------------------------------------------------
-def _init_array(inits, name):
-    if name is None or name not in inits:
-        return None
-    v = inits[name]
-    return np.asarray(v) if v is not None else None
-
-
-def _fold_conv_bn_inplace(conv, bn, inits) -> bool:
-    """Fold a real Conv->BN pair's affine into the Conv weight/bias (forward)."""
-    scale = _init_array(inits, bn.inputs[1] if len(bn.inputs) > 1 else None)
-    var = _init_array(inits, bn.inputs[4] if len(bn.inputs) > 4 else None)
-    if scale is None or var is None:
-        return False
-    eps = float(bn.attrs.get("epsilon", 1e-5))
-    sigma = np.sqrt(np.asarray(var, dtype=np.float64) + eps)
-    gamma = np.asarray(scale, dtype=np.float64) / sigma
-    beta0 = _init_array(inits, bn.inputs[2] if len(bn.inputs) > 2 else None)
-    mu = _init_array(inits, bn.inputs[3] if len(bn.inputs) > 3 else None)
-    beta = (np.zeros_like(gamma) if beta0 is None else np.asarray(beta0, dtype=np.float64))         - np.asarray(scale, dtype=np.float64) *         (np.zeros_like(gamma) if mu is None else np.asarray(mu, dtype=np.float64)) / sigma
-    wname = conv.inputs[1] if len(conv.inputs) > 1 else None
-    if wname and wname in inits and inits[wname] is not None:
-        W = np.asarray(inits[wname], dtype=np.float64) * gamma.reshape(
-            (-1,) + (1,) * (np.asarray(inits[wname]).ndim - 1))
-        inits[wname] = W.astype(np.asarray(inits[wname]).dtype)
-    bname = conv.inputs[2] if len(conv.inputs) > 2 else conv.name + ".bias_folded"
-    inits[bname] = beta.astype(np.float32)
-    if len(conv.inputs) <= 2:
-        conv.inputs = conv.inputs + [bname]
-    else:
-        conv.inputs = conv.inputs[:2] + [bname]
-    return True
-
-
 def prefuse_conv_bn(graph: Graph) -> List[Dict[str, Any]]:
-    """Recognise Conv+BatchNorm fusions, returning annotation log entries.
+    """DEPRECATED — safe no-op.  Conv-BN fusion is handled by
+    ``FusionPass._match_conv_bn`` with strict safety guards.
 
-    The graph is NOT structurally rewritten with a materialised BN node.
-    Inserting one perturbs the producer/consumer graph enough to corrupt the
-    later EW-chain matcher (it stitches cross-block Relu chains into spurious
-    groups). Instead this returns recognition records appended to fusion_log,
-    so the pattern is credited transparently with zero side effects.
-
-    Two recognition modes:
-
-    * **Real Conv->BN** - a genuine Conv -> BatchNormalization edge. The affine
-      is folded into the Conv (forward) and a FusedConv2dBatchNorm annotation is
-      emitted; the BN node is consumed/dropped.
-    * **Pre-folded Conv (ResNet case)** - a Conv carrying a non-trivial bias that
-      is the signature of BN absorption at export time. Emitted as a
-      FusedConv2dBatchNorm annotation; the Conv is untouched (its bias already
-      encodes the folded BN).
+    Returns an empty list and does not modify the graph.  Kept for backward
+    compatibility of the public import path.
     """
-    init = graph.initializers
-    init_names = graph.initializer_names
-    annotations: List[Dict[str, Any]] = []
-
-    consumers = graph.consumer_map()
-    consumed_bn: Set[str] = set()
-    for n in graph.nodes:
-        if n.op_type != "Conv" or not n.outputs:
-            continue
-        bn = next((c for c in consumers.get(n.outputs[0], [])
-                   if c.op_type in ("BatchNormalization", "BatchNorm")), None)
-        if bn is not None and _fold_conv_bn_inplace(n, bn, init):
-            annotations.append({
-                "pattern": "FusedConv2dBatchNorm",
-                "nodes": [n.name, bn.name],
-                "fused_node": n.name,
-                "annotation": "Conv->BN affine folded into Conv weight/bias",
-            })
-            consumed_bn.add(bn.name)
-    if consumed_bn:
-        graph.nodes = [n for n in graph.nodes if n.name not in consumed_bn]
-
-    # Pre-folded Convs: a non-trivial initializer bias is the BN-absorption trace.
-    # Only emitted when no real Conv->BN was found (otherwise redundant).
-    if not annotations:
-        for n in graph.nodes:
-            if n.op_type != "Conv" or len(n.inputs) < 3:
-                continue
-            bname = n.inputs[2]
-            if bname not in init_names:
-                continue
-            b = _init_array(init, bname)
-            if b is None or not np.any(np.asarray(b)):
-                continue  # all-zero bias: not a BN fold signature
-            annotations.append({
-                "pattern": "FusedConv2dBatchNorm",
-                "nodes": [n.name],
-                "fused_node": n.name,
-                "annotation": "Conv(bias) recognised as pre-folded Conv+BatchNorm",
-            })
-            break  # one recognition is enough to credit the pattern
-    return annotations
+    return []

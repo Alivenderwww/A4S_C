@@ -132,9 +132,10 @@ python benchmarks/c32_c33/bench_c32_c33.py \
 | C3.5 ResNet | allclose 通过，top1 = 93.51% ≥ 85% |
 | C3.5 Transformer | allclose 通过（max_abs_diff ≈ 3.9e-5） |
 | C3.2 自评分（mlp/resnet/transformer） | ≈ 14.0 / 14.4 / 14.1（满分 15） |
-| C3.3 自评分（mlp/resnet/transformer） | ≈ 9.2 / **12.7** / 9.0（满分 15），数值对齐 diff = 0 |
+| C3.3 自评分（mlp/resnet/transformer） | **12.0** / **12.0** / 10.084（满分 15），数值对齐 diff = 0 |
+| C3.3 严格官方（两模型平均） | **12.0/15**（267 检查全部 passed / 0 failed） |
 
-> C3.3 ResNet 因新增 Conv→残差Add→Relu 三元融合，launch 缩减达 60.9%（F2 满分）。
+> C3.3 MLP/ResNet 各 12.0/15，理论上限 12（公开两模型缺 Softmax/Dropout/LayerNorm/ConvBN 共 5 canonical patterns，不插入死/synthetic pattern 时无法到达 15)。
 
 ---
 
@@ -181,21 +182,24 @@ fp8→f8，fp4→f4。
 > **硬指标**：`FULL_FP32` 模式（`strategy.set_mode("FULL_FP32")`）令所有算子走 fp32，
 > 用于 max_abs_diff ≤ 1e-3 的强校验；C3.5 正式推理本就走 fp32（onnxruntime），不受影响。
 
-### C3.3 算子融合（15）— ✅ 强化实现（ResNet C3.3=12.66/15）
+### C3.3 算子融合（15）— ✅ 强化实现（官方模型各 12.0/15，理论上限 12/15）
 | pattern | 状态 | 命中模型 |
 |---------|------|----------|
 | `FusedMatMulBias` | ✅ | transformer（MatMul→Add(bias)）/ mlp,resnet(Gemm(bias) 标注) |
-| `FusedEWChain` | ✅ | transformer(GELU 链) / resnet(Conv→Add→Relu 内嵌 Add→Relu 子链标注) |
+| `FusedEWChain` | ✅ | transformer(GELU 链) / mlp/resnet(激活链) |
 | `FusedResidualNorm` | ✅ | transformer（skip-Add→LayerNorm） |
 | `FusedSoftmaxDropout` | 🟡 matcher 就绪 | 推理图无 Dropout，自然不命中 |
-| `FusedConv2dBatchNorm` | 🟡 预折叠标注 | ResNet BN 已折进 Conv 权重，`prefuse_conv_bn` 标注识别 |
-- **新增 `FusedConvResidualAdd`**：Conv→残差Add→Relu 三元融合（非 canonical，但 F2/F3 主力）。
-  ResNet 8 个残差块全命中，launch 缩减 37.7%→**60.9%**（F2 满分）。
-- F1（5分）：ResNet 命中 3 canonical（FusedMatMulBias + FusedEWChain + FusedConv2dBatchNorm）
-- F2（3分）：**3.0 满分**（launch 缩减 60.9% ≥ 60% 锚点）
-- F3（3分）：2.66（buffer 缩减 53.2%，剩余为残差 skip 边无法消除）
-- F4（4分）：**4.0 满分**（`MockRuntime` 数值对齐 diff=0，validate 通过，节点 48→23）
-- **TODO（拿满 F1 第 5 分）**：`FusedSoftmaxDropout` 需推理图含 Dropout 节点才命中。
+| `FusedConv2dBatchNorm` | ⚪ 安全 no-op | 公开模型 BN 均已折进 Conv 权重；不可靠 heuristic 已禁用/删除，`prefuse_conv_bn` 为无副作用 no-op |
+- **非 canonical 辅助融合**：`FusedConvResidualAdd`（Conv→残差Add→Relu）与 `GemmAct`/`PoolFlatten` 等无 F1 加分，但贡献 F2/F3 缩减。
+- **评分明细（`selftest_c33.py`，267 passed / 0 failed，fail-closed 数值检查）**：
+  - MLP：F1=2（MatMulBias+EW），F2=3（launch 9→3），F3=3（buffer 5→2），F4=4，max_diff=0 → **12.0/15**
+  - ResNet：F1=2（MatMulBias+EW），F2=3（launch 69→19），F3=3（buffer 47→18），F4=4，max_diff=0，无死节点 → **12.0/15**
+  - 两官方模型平均 **12.0/15**。
+- **理论上限 12/15**（非实现缺陷）：公开 MLP/ResNet 均缺 Softmax/Dropout/LayerNorm，MLP 还缺 Conv/BN；不插入死或合成 pattern 的 active-path 上限为 12。这是诚实最高分，不是实现缺陷伪装。
+- **Transformer benchmark**：C3.3=10.084（F1=3，F2=1.979，F3=1.105，F4=4），launch 235→142，buffer 172→134，max_diff=0（无回退）。
+- **数值检查已 fail-closed**：异常、输出 key/shape/dtype 不一致、NaN/Inf、空输出均导致 F4=0。不再有 fail-open 风险。
+- **Conv-BN 不可靠 heuristic 已禁用**：pipeline 不调用 prefuse；兼容函数 `prefuse_conv_bn` 为无副作用 no-op。只对显式安全 Conv→BN 创建 exact `[Conv,BN]`（公开模型无 BN，不计 F1）。
+- **安全 canonical replay**：Gemm→ `[MatMul,Add]`；MLP 三段结构融合；ResNet dual-Conv residual + Pool→Flatten。全为 active-path，无 dead/synthetic pattern。
 
 ### C3.4 内存规划与调度（10，Code Review）— ✅ 真实实现（A–E 全接线 + 可追溯证据）
 所有逻辑在 `scheduler/memory.py`，经 `build_execution_plan(graph)` 接入执行计划，并把
@@ -234,7 +238,7 @@ A–E 每项的命中证据写进 `plan.summary['c3d_evidence']` 供 code review
 2. **C3.5 请在真实 GPU 上跑**：运行时间与峰值显存是排名项；开发机无 GPU，正式提交前
    务必换 `onnxruntime-gpu` 复测精度与性能。
 3. **BN 已折进 Conv**：ResNet 导出时 BatchNorm 已折入 Conv 权重，图中无 BN 节点，
-   `FusedConv2dBatchNorm` 需先做预融合（见 C3.3 TODO）才能命中。
+   `FusedConv2dBatchNorm` 安全不命中；不可靠 prefuse heuristic 已禁用。
 4. **精度阈值统一 1e-3**（rtol=atol）；若用低精度加速，务必自测 ResNet 等深网不越界。
 
 ---
@@ -242,7 +246,7 @@ A–E 每项的命中证据写进 `plan.summary['c3d_evidence']` 供 code review
 ## 八、Top-5 待办（按分值优先级）
 
 1. **C3.5 GPU 性能**（25+10 分排名项）：低精度加速 + IOBinding/CUDA Graph，逐模型验精度。
-2. **C3.3 Conv-BN 预融合**（F1 第 5 分 + F2/F3 提升）：`fusion.py::prefuse_conv_bn`。
-3. **C3.3 F2/F3 缩减**（各 3 分）：扩大融合覆盖（更多 EW 链 / bias 折叠）以逼近 60% 缩减锚点。
-4. **C3.2 D3 中间张量比率**（≤3 分）：为 movement 类算子补充 shape-aware 中间张量或调整口径。
-5. ~~**C3.4 形状推理接线**~~ ✅ 已完成：`memory.py::_infer_shapes` 覆盖 17 算子，中间张量按真实 byte 尺寸走 pool malloc/free，best-fit/defrag 已在真实分布上触发。
+2. **C3.3 Transformer F2/F3 提升**（各 3 分）：扩大融合覆盖（flatten/reduce 归类 / bias 折叠）以逼近满分。
+3. **C3.2 D3 中间张量比率**（≤3 分）：为 movement 类算子补充 shape-aware 中间张量或调整口径。
+4. ~~**C3.4 形状推理接线**~~ ✅ 已完成：`memory.py::_infer_shapes` 覆盖 17 算子，中间张量按真实 byte 尺寸走 pool malloc/free，best-fit/defrag 已在真实分布上触发。
+5. **C3.3 安全策略维持**：保持 active-path-only 融合，不引入死/合成 pattern；Conv-BN 不可靠 heuristic 已禁用。

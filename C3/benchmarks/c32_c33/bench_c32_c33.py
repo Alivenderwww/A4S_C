@@ -231,24 +231,59 @@ def score_c33(graph, model_key):
     }
 
 
-def _numeric_align(graph, opt, model_key):
-    name, dtype, shape = INPUT_SHAPES[model_key]
-    rng = np.random.default_rng(0)
-    if dtype == np.int64:
-        x = rng.integers(0, 13, size=shape, dtype=np.int64)
+def _numeric_align(graph, opt, model_key, feed_dict=None):
+    """Numerical alignment check: original vs optimized graph.
+
+    Returns ``(align_ok, max_diff)``:
+
+    * ``(True, max_diff)`` — all checks pass and ``max_abs_diff <= 1e-3``.
+    * ``(False, max_diff)`` — max_abs_diff > 1e-3 but computable (finite).
+    * ``(False, None)``     — non-computable (exception, key/shape/dtype
+      mismatch, NaN/Inf in output or diff, or empty output set).
+
+    If *feed_dict* is provided it is used directly; otherwise a random feed is
+    generated from *model_key*.
+    """
+    if feed_dict is not None:
+        feed = feed_dict
     else:
-        x = rng.standard_normal(shape).astype(dtype)
-    feed = {name: x}
+        name, dtype, shape = INPUT_SHAPES[model_key]
+        rng = np.random.default_rng(0)
+        if dtype == np.int64:
+            x = rng.integers(0, 13, size=shape, dtype=np.int64)
+        else:
+            x = rng.standard_normal(shape).astype(dtype)
+        feed = {name: x}
     try:
         o1 = MockRuntime(graph).run(feed)
         o2 = MockRuntime(opt).run(feed)
     except Exception as exc:
-        print(f"  [align] runtime error ({exc}); skipping numeric check", file=sys.stderr)
-        return True, None  # do not fail F4 purely on a runtime gap
+        print(f"  [align] runtime error ({exc}); numeric check failed", file=sys.stderr)
+        return False, None  # fail-closed
+    # Empty output set → fail
+    if not o1 or not o2:
+        return False, None
+    # Output key sets must match exactly
+    if set(o1.keys()) != set(o2.keys()):
+        return False, None
     max_diff = 0.0
     for k in o1:
-        if k in o2:
-            max_diff = max(max_diff, float(np.max(np.abs(o1[k] - o2[k]))))
+        a, b = o1[k], o2[k]
+        # Shape must match
+        if a.shape != b.shape:
+            return False, None
+        # Dtype must match
+        if a.dtype != b.dtype:
+            return False, None
+        # Both outputs must be fully finite
+        if not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
+            return False, None
+        diff = a - b
+        # Diff must be fully finite
+        if not np.all(np.isfinite(diff)):
+            return False, None
+        max_diff = max(max_diff, float(np.max(np.abs(diff))))
+    # Threshold check: only ≤ 1e-3 is a pass
     return (max_diff <= 1e-3), max_diff
 
 
