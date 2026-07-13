@@ -241,21 +241,32 @@ void Builder::translate(const ptx::Instruction &s) {
       if (s.mods[i] == "param") isParam = true;
       if (s.mods[i] == "shared") isShared = true;
     }
-    ir::Inst in;
-    in.op = Op::LD; in.type = narrowAddr(ty == Type::NONE ? Type::B32 : ty);
-    in.dst = ir::Operand::reg(regFor(s.operands[0].name));
+    const Type lty = narrowAddr(ty == Type::NONE ? Type::B32 : ty);
     if (isParam) {
+      // ABI (spec §7): params live in .pmem addressed by a byte offset held in a
+      // register -> materialize the offset, then LD.pmem [Rtmp]. A .u64 param is
+      // narrowed to its low word (the high 32 bits are 0 per §8.2 and unused).
+      const std::string pname = s.operands.size() > 1 ? s.operands[1].name : "";
+      std::map<std::string, unsigned>::iterator it = paramOff.find(pname);
+      uint32_t off = (it != paramOff.end()) ? it->second : 0;
+      uint32_t tmp = freshReg();
+      ir::Inst li; li.op = Op::LOADI; li.type = Type::U32;
+      li.dst = ir::Operand::reg(tmp); li.hasImm = true; li.imm = off;
+      emit(li);
+      ir::Inst in; in.op = Op::LD; in.type = lty;
+      in.dst = ir::Operand::reg(regFor(s.operands[0].name));
       in.modifier = (uint32_t)Space::PMEM;
-      in.hasImm = true;
-      std::map<std::string, unsigned>::iterator it =
-          paramOff.find(s.operands.size() > 1 ? s.operands[1].name : "");
-      in.imm = (it != paramOff.end()) ? it->second : 0;
-      in.note = "param:" + (s.operands.size() > 1 ? s.operands[1].name : "");
-    } else {
-      in.modifier = isShared ? (uint32_t)Space::SMEM : (uint32_t)Space::GMEM;
-      if (s.operands.size() > 1)
-        in.s1 = ir::Operand::reg(regFor(s.operands[1].name)); // address reg
+      in.s1 = ir::Operand::reg(tmp);            // address register (byte offset)
+      in.note = "param:" + pname;
+      emit(in);
+      return;
     }
+    ir::Inst in;
+    in.op = Op::LD; in.type = lty;
+    in.dst = ir::Operand::reg(regFor(s.operands[0].name));
+    in.modifier = isShared ? (uint32_t)Space::SMEM : (uint32_t)Space::GMEM;
+    if (s.operands.size() > 1)
+      in.s1 = ir::Operand::reg(regFor(s.operands[1].name)); // address reg
     emit(in);
     return;
   }

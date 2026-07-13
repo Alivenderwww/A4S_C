@@ -69,6 +69,15 @@ bool predOpt(ir::Function &fn, const Options &opt) {
     if (last.op != ir::Op::BRX || last.guard < 0) continue;
     std::map<std::string, int>::iterator it = labelIdx.find(last.target);
     if (it == labelIdx.end() || it->second <= bi) continue;   // must be forward.
+    // Skip a LOOP-EXIT guard: if any later block branches back into this block,
+    // it is a loop header and the forward `BRX` is the loop exit, not a bounds
+    // guard. If-converting it would delete the exit and leave the back-edge
+    // unconditional -> infinite loop (e.g. a `while (k<K)` GEMM K-loop).
+    bool loopHeader = false;
+    for (int bb = bi + 1; bb < n && !loopHeader; ++bb)
+      for (unsigned s = 0; s < fn.blocks[bb].succ.size(); ++s)
+        if (fn.blocks[bb].succ[s] == bi) { loopHeader = true; break; }
+    if (loopHeader) continue;
     uint32_t pg = (uint32_t)(last.guard & 0x7);
     int cidx = -1;
     for (int ii = (int)fn.blocks[bi].insts.size() - 2; ii >= 0; --ii) {

@@ -31,11 +31,10 @@ static bool isTypeless(Op op) {
   }
 }
 
-bool usesImmediate(Op op, uint32_t memory_space) {
+bool usesImmediate(Op op, uint32_t /*memory_space*/) {
   return op == Op::LOADI || op == Op::LOADI64 || op == Op::BR ||
          op == Op::BRX || op == Op::CALL || op == Op::SSYNC ||
-         op == Op::RDPMC ||
-         (op == Op::LD && memory_space == static_cast<uint32_t>(Space::PMEM));
+         op == Op::RDPMC;
 }
 
 // Tensor precision mode (Pred/Ctrl [10:8]); mode 7 uses the extended selector.
