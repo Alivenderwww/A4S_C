@@ -1,16 +1,16 @@
 # Makefile - AEC C1 compiler (aec-cc) + disassembler (aec-objdump).
 #
-# The eval image ships GCC 13.3 (C++17); this dev host has g++ 4.9.2 which does
-# NOT accept -std=c++17. We therefore auto-detect the newest -std the compiler
-# accepts (c++17 -> else c++11). The source is written C++11-safe so it builds
-# under both. See README.md ("构建") for the Windows/WSL note.
+# Pinned to -std=c++11: the source is written and tested against C++11 (this dev
+# host has g++ 4.9.2), and every modern toolchain -- including the grader's GCC
+# 13.3 -- accepts -std=c++11. Pinning it (rather than opting into c++17) keeps
+# the build on the exact standard the code was compiled against, avoiding any
+# reliance on never-tested C++17 behavior. -finput-charset=UTF-8 makes the UTF-8
+# source comments portable across locales. See README.md ("构建").
 
 CXX ?= g++
+CXXSTD := c++11
 
-# Pick c++17 when available, else fall back to c++11 (g++ 4.9.2).
-CXXSTD := $(shell echo 'int main(){return 0;}' | $(CXX) -std=c++17 -fsyntax-only -x c++ - 2>/dev/null && echo c++17 || echo c++11)
-
-CXXFLAGS ?= -std=$(CXXSTD) -O2 -Wall -Wextra -Iinclude -MMD -MP
+CXXFLAGS ?= -std=$(CXXSTD) -finput-charset=UTF-8 -O2 -Wall -Wextra -Iinclude -MMD -MP
 LDFLAGS  ?=
 
 # Windows (MinGW) appends .exe; keep both hosts happy.
@@ -35,14 +35,13 @@ all: build submit
 build: $(CC_BIN) $(OD_BIN)
 	@echo "built with -std=$(CXXSTD): $(CC_BIN) $(OD_BIN)"
 
-# Place the required submission entry points at the paths the grader invokes:
-#   compiler/aec-cc  disassembler/aec-objdump  agent/run_agent
+# Place the required submission entry point (spec §14) at the path the grader
+# invokes: compiler/aec-cc. disassembler/aec-objdump is our companion tool.
 submit: build
 	@mkdir -p compiler disassembler
 	@cp $(CC_BIN) compiler/aec-cc$(EXE)
 	@cp $(OD_BIN) disassembler/aec-objdump$(EXE)
-	@chmod +x agent/run_agent 2>/dev/null || true
-	@echo "submission entry points ready: compiler/aec-cc  disassembler/aec-objdump  agent/run_agent"
+	@echo "submission entry points ready: compiler/aec-cc  disassembler/aec-objdump"
 
 $(CC_BIN): $(LIB_OBJ) $(CC_OBJ)
 	@mkdir -p bin

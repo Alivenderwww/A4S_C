@@ -8,7 +8,7 @@
 - 前端：PTX 词法/语法分析 → PTX AST。
 - 中端：AST → 内部 IR（基本块 + CFG）→ 优化 pass 流水线。
 - 后端：谓词化 if-conversion → 循环展开 → 列表调度(pre-RA) → 线性扫描分配 → 降级 → 128-bit 编码 → 裸 `.aecbin` 指令流。
-- 工具：`aec-cc`（编译器）、`aec-objdump`（反汇编器）、`agent/run_agent.py`（自动调优）。
+- 工具：`aec-cc`（编译器，提交入口 `compiler/aec-cc`）、`aec-objdump`（配套反汇编器）。
 
 具体完成度、验证数字、风险、TODO 详见 [`../docs/C1-完成度审计.md`](../docs/C1-完成度审计.md)（工程状态唯一事实源）。
 
@@ -20,7 +20,7 @@
 
 ```
 C1/
-├── Makefile                     构建脚本（自动探测 -std=c++17/ c++11）
+├── Makefile                     构建脚本（固定 -std=c++11，POSIX recipe）
 ├── README.md                    本手册
 ├── include/aec/                 公共头文件
 │   ├── isa.h                    AEC ISA 常量 + 128-bit 编码器/解码器声明
@@ -37,11 +37,16 @@ C1/
 │   ├── ptx/parser.cpp           tokens → PTX AST（递归下降）
 │   ├── ir/ir_builder.cpp        PTX AST → IR + 指令选择 + 基本块切分
 │   ├── ir/cfg.cpp               CFG 构建（succ/pred）
-│   ├── passes/const_prop.cpp    常量传播          （T2）
-│   ├── passes/dce.cpp           死代码消除        （T2）
+│   ├── passes/const_prop.cpp    常量传播 / 折叠     （T2）
+│   ├── passes/copy_prop.cpp     复制传播           （T2）
 │   ├── passes/cse.cpp           公共子表达式消除 + 冗余 load 消除（T2/T3）
+│   ├── passes/mad_contract.cpp  MUL;ADD → MAD 合并（非融合，省指令）（T2-T5）
+│   ├── passes/dce.cpp           死代码消除         （T2）
 │   ├── passes/licm.cpp          循环不变量外提 + 循环不变 load 外提（T2/T3）
-│   ├── passes/pred_opt.cpp      谓词执行优化      （T2）
+│   ├── passes/pred_opt.cpp      边界 guard if-conversion（T2/正确性）
+│   ├── passes/loop_rotate.cpp   while → do-while 规范化（使能展开，T5）
+│   ├── passes/strength_reduce.cpp 地址归纳变量强度削减（→加法递推，T5）
+│   ├── passes/unroll.cpp        循环展开（省循环控制指令）（T5）
 │   ├── regalloc/linear_scan.cpp 256-GPR 线性扫描分配（T4）
 │   ├── sched/list_sched.cpp     DDG + 列表调度 + 双发射配对（T4）
 │   ├── codegen/lower.cpp        末端合法化 + 展平 + 分支目标解析（T1/T5）
@@ -51,7 +56,7 @@ C1/
 ├── tools/
 │   ├── aec-cc.cpp               编译器 CLI 入口
 │   └── aec-objdump.cpp          反汇编器 CLI 入口
-├── agent/run_agent.py           自动调优循环（多配置扫描 → 选优 → 重编 → 报告）
+├── sim/                         自建 AEC 功能模拟器 + 官方 CModel 验证 harness
 └── tests/run_public.sh          编译 + 反汇编 + 校验全部 5 个公开用例
 ```
 
@@ -67,20 +72,19 @@ make test       # 构建并跑 tests/run_public.sh
 make clean      # 清理 obj/ bin/
 ```
 
-### 关于编译器版本（重要）
+### 关于编译器标准（重要）
 
-- **评测镜像使用 GCC 13.3（支持 C++17）**；本开发机装的是 **g++ 4.9.2**，它**不认识
-  `-std=c++17`**（会报 `unrecognized command line option`）。
-- Makefile 因此**自动探测**：先试 `-std=c++17`，不支持则回退 `-std=c++11`：
-  ```make
-  CXXSTD := $(shell echo 'int main(){return 0;}' | $(CXX) -std=c++17 -fsyntax-only -x c++ - 2>/dev/null && echo c++17 || echo c++11)
-  ```
-- **源码全部按 C++11 编写**（不使用 `std::optional`/`std::filesystem`/结构化绑定/
-  `make_unique` 等 C++14/17 库特性），因此在 g++ 4.9.2 与 GCC 13.3 上都能编译。
-- **Windows 提示**：请在 **Git Bash / MSYS2 / WSL** 下执行 `make`（recipe 里用了
-  `mkdir -p`、`rm -rf` 等 POSIX 命令）。MinGW 下产物会带 `.exe` 后缀，Makefile 已用
-  `$(EXE)` 处理；Git Bash 下 `./bin/aec-cc` 能自动匹配 `aec-cc.exe`。若用原生 GCC 建议
-  直接在 WSL/新版 g++ 下构建，与评测环境一致。
+- **固定 `-std=c++11`**：源码全部按 C++11 编写并在 g++ 4.9.2 上测试；评测镜像的
+  **GCC 13.3 完全支持 c++11**，固定它（而非启用 c++17）让构建停在代码实际编译验证过的
+  标准上，避免依赖任何从未测过的 C++17 行为。
+- 不使用 C++14/17 库特性（`std::optional`/`std::filesystem`/结构化绑定/`make_unique`），
+  也不使用 C++17 移除的特性（`register`/`std::auto_ptr`/`std::random_shuffle`/动态异常规格）。
+- `-finput-charset=UTF-8` 保证源码里的 UTF-8 中文注释跨 locale 可移植。
+- **构建入口**：`make` 用了 POSIX recipe（`mkdir -p`/`rm -rf`），在 Linux/WSL/Git Bash 下
+  执行。Linux 下产物为 `compiler/aec-cc`（无 `.exe` 后缀），即评测调用的入口；MinGW 下带
+  `.exe`，Makefile 用 `$(EXE)` 统一处理。
+- **提交前建议**：在一台带 GCC 的 Linux 机器上跑一次 `make build submit`，确认评测环境能
+  从源码构建出 `compiler/aec-cc`（本开发机 g++ 4.9.2 只能验证 c++11 编译，未在 GCC 13/ARM 上实测）。
 
 ---
 
@@ -97,21 +101,18 @@ bin/aec-cc input.ptx -O3 -o out.aecbin
 # 输出性能报告（供 Agent 读取）
 bin/aec-cc input.ptx -O2 -o out.aecbin --report perf.json
 
-# 单独关闭某个 pass（供 Agent 探索配置空间）
-bin/aec-cc input.ptx -O2 --no-cse --no-dual-issue -o out.aecbin
+# 单独关闭某个 pass（A/B 对比调试）
+bin/aec-cc input.ptx -O2 --no-cse --no-mad-contract -o out.aecbin
 
 # 反汇编为可读 AEC 汇编
 bin/aec-objdump out.aecbin
 
 # 编码器 golden 自检
 bin/aec-cc --selftest
-
-# 自动调优（扫描多配置、选周期最少者、重编并生成最终报告）
-python3 agent/run_agent.py input.ptx -o out.aecbin --report agent_report.json
 ```
 
 `aec-cc` 支持的开关：`-O0/-O2/-O3`、`-o`、`--report`、`--sched-window N`、
-`--no-const-prop|--no-dce|--no-cse|--no-licm|--no-pred-opt|--no-dual-issue`、
+`--no-const-prop|--no-copy-prop|--no-dce|--no-cse|--no-licm|--no-mad-contract|--no-pred-opt|--no-dual-issue`、
 `--selftest`、`-v/--verbose`、`-h/--help`。
 
 ---
@@ -133,10 +134,10 @@ python3 agent/run_agent.py input.ptx -o out.aecbin --report agent_report.json
       ▼
    带 CFG 的 IR
       │  passes/*.cpp（-O2/-O3 按序执行；-O0 跳过）
-      │    const_prop → cse → licm → dce →（迭代）→ pred_opt
+      │    const_prop → copy_prop → cse → mad_contract → licm → dce →（迭代）→ pred_opt
       ▼
    优化后 IR
-      │  unroll.cpp（循环展开，-O2/-O3 按选项）
+      │  loop_rotate → strength_reduce → unroll（-O2；while→do-while→地址递推→展开）
       │  list_sched.cpp（DDG + 列表调度 + 双发射配对，pre-RA）
       │  linear_scan.cpp（虚拟寄存器 → 物理 R1..R255）
       │  lower.cpp（展平 + 分支标签 → 绝对 PC）
