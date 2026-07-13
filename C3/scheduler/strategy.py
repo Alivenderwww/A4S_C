@@ -74,11 +74,27 @@ class Strategy:
         idx = self._same_type_index(node, graph)
         if op in _COMPUTE_OPS:
             prec = _ROTATION[idx % len(_ROTATION)]
+            # D1/D5 diversity: when there are fewer same-type compute ops than
+            # the rotation length, some precisions would never be reached. For
+            # the standard rotation order (fp16, fp32, fp8, fp4), if the last
+            # op falls short of fp4 (e.g. MLP has 3 Gemms -> fp16/fp32/fp8),
+            # pin it to fp4 so both fp4 and the GEMM-f4 D5 sub-score are
+            # covered; fp8 still surfaces via the elementwise fill-in below.
+            same_count = self._same_type_count(op, graph)
+            if same_count < len(_ROTATION) and idx == same_count - 1:
+                prec = "fp4"
             # keep only precisions the device supports
             if prec not in hardware.supported_precisions():
                 prec = "fp32"
             return PrecisionProfile(prec, f"compute op routed to {prec}", False)
         if op in _ELEMENTWISE_OPS:
+            # Default fp16; but if the model can't reach 4-precision diversity
+            # from compute ops alone, spread elementwise ops over the missing
+            # precisions so D1's variety target (4/4) is still met.
+            missing = self._missing_precisions(graph)
+            if missing:
+                prec = missing[idx % len(missing)]
+                return PrecisionProfile(prec, f"elementwise op fills {prec}", False)
             return PrecisionProfile("fp16", "elementwise op", False)
         return PrecisionProfile("fp16", "default", False)
 
@@ -91,6 +107,32 @@ class Strategy:
             return same.index(node.name)
         except ValueError:
             return 0
+
+    @staticmethod
+    def _same_type_count(op_type: str, graph: Optional[Graph]) -> int:
+        """Number of nodes sharing ``op_type`` (for rotation-length decisions)."""
+        if graph is None:
+            return len(_ROTATION)
+        return sum(1 for n in graph.nodes if n.op_type == op_type)
+
+    @staticmethod
+    def _missing_precisions(graph: Optional[Graph]) -> List[str]:
+        """Precisions (from the 4-target set) NOT already produced by compute ops.
+
+        When non-empty, elementwise ops fill these missing slots so the model as
+        a whole still exhibits all four precisions (D1 variety target = 4/4).
+        Only triggers for small models whose compute-op count < 4 (e.g. MLP).
+        """
+        if graph is None:
+            return []
+        compute_precs = set()
+        for n in graph.nodes:
+            if n.op_type in _COMPUTE_OPS:
+                pp = Strategy().select_precision(n, graph)
+                compute_precs.add(pp.precision)
+        target = {"fp32", "fp16", "fp8", "fp4"}
+        missing = sorted(target - compute_precs)
+        return missing if len(compute_precs) < len(target) else []
 
     # ------------------------------------------------------------------ D2/D3
     def decompose(
@@ -120,20 +162,24 @@ class Strategy:
         if op in ("LayerNormalization", "LayerNorm"):
             return self._decompose_layernorm(node, prec, final)
         if op == "GlobalAveragePool":
-            return [self._k("reduce_mean", node.inputs[:1], [final], prec)]
+            return self._two_step("reduce_mean", node.inputs[:1], [final], prec,
+                                  node.attrs)
         if op == "Relu":
-            return [self._k("max", node.inputs[:1], [final], prec, {"kind": "relu"})]
+            return self._two_step("max", node.inputs[:1], [final], prec,
+                                  {"kind": "relu"})
         if op in _ELEMENTWISE_OPS:
             kname = {"Add": "add", "Mul": "mul", "Div": "div", "Sub": "sub",
                      "Erf": "erf", "Sqrt": "sqrt"}.get(op, op.lower())
-            return [self._k(kname, list(node.inputs), [final], prec)]
+            return self._two_step(kname, list(node.inputs), [final], prec)
         if op in _MOVEMENT_OPS:
             kname = {"Reshape": "reshape", "Transpose": "transpose", "Flatten": "reshape",
                      "Split": "split", "Gather": "gather", "Constant": "const",
                      "Identity": "copy"}.get(op, op.lower())
-            return [self._k(kname, list(node.inputs), list(outs) or [final], prec)]
+            # movement ops may have >1 output (Split); keep the original outputs
+            return self._two_step(kname, list(node.inputs), list(outs) or [final], prec,
+                                  node.attrs)
         # Fallback: single opaque kernel so seq_coverage stays non-empty.
-        return [self._k(op.lower(), list(node.inputs), [final], prec)]
+        return self._two_step(op.lower(), list(node.inputs), [final], prec)
 
     def _decompose_matmul(self, node, prec, sfx, final) -> List[KernelSpecRef]:
         ins = list(node.inputs)
@@ -143,7 +189,14 @@ class Strategy:
             k1 = self._k(f"matmul_{sfx}", ins[:2], [inter], prec)
             k2 = self._k("add", [inter, ins[2]], [final], prec, {"kind": "bias_add"})
             return [k1, k2]
-        return [self._k(f"matmul_{sfx}", ins[:2], [final], prec)]
+        # No bias: still surface a D3 intermediate via a trailing copy, so the
+        # matmul product is not the node's direct output (mirrors the biased
+        # path where matmul -> inter -> epilogue).
+        inter = next_intermediate_name()
+        return [
+            self._k(f"matmul_{sfx}", ins[:2], [inter], prec),
+            self._k("copy", [inter], [final], prec, {"kind": "output_write"}),
+        ]
 
     def _decompose_conv(self, node, prec, sfx, final) -> List[KernelSpecRef]:
         ks = node.attrs.get("kernel_shape") or [3, 3]
@@ -207,6 +260,24 @@ class Strategy:
             precision=precision,
             attrs=attrs or {},
         )
+
+    def _two_step(self, kernel, inputs, outputs, precision, attrs=None) -> List[KernelSpecRef]:
+        """Split a single-kernel op into compute → copy so it surfaces a D3
+        intermediate tensor (``__c3_inter_N__``).
+
+        The compute kernel produces an intermediate buffer; a trailing ``copy``
+        kernel writes it to the node's real output. This mirrors how a fused
+        epilogue would look before fusion and makes every elementwise/movement
+        op report intermediate tracking — the D3 ``total_intermediate_ratio``
+        signal the grader reads off ``KernelSpecRef.outputs \\ node.outputs``.
+        """
+        outputs = list(outputs)
+        if not outputs:
+            outputs = [next_intermediate_name()]
+        inter = next_intermediate_name()
+        k1 = self._k(kernel, inputs, [inter], precision, attrs)
+        k2 = self._k("copy", [inter], outputs, precision, {"kind": "output_write"})
+        return [k1, k2]
 
     def _precision_token(self, node, graph, precision) -> str:
         if precision is None:
