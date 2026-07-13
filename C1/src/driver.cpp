@@ -14,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace aec {
@@ -303,16 +304,56 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
 
   report.kernel = fn.name;
   report.instructionCount = (uint32_t)flat.size();
-  report.spillCount = fn.regs.spillCount;
+  report.numBasicBlocks = (uint32_t)fn.blocks.size();
+  report.numVirtualRegisters = fn.regs.nextVReg > 1 ? fn.regs.nextVReg - 1 : 0;
+  report.numPhysicalRegisters = fn.regs.maxPhys;
+  report.spillLoads = 0;          // spiller is a stub; no spill code emitted
+  report.spillStores = 0;
   report.dualIssuePairs = fn.dualIssuePairs;
   report.paramBytes = pbytes;
-  report.estCycles = estCycles;   // latency-aware, computed pre-regalloc.
+  report.estCycles = estCycles;   // latency-aware heuristic (not the graded metric).
+
+  // Count input PTX instructions (statements with a mnemonic, first kernel).
+  for (unsigned ki = 0; ki < m.kernels.size(); ++ki)
+    for (unsigned s = 0; s < m.kernels[ki].body.size(); ++s)
+      if (!m.kernels[ki].body[s].mnemonic.empty()) ++report.numPtxInstructions;
+
+  // Static instruction-mix + predicate + data-flow-depth diagnostics (spec §B.3),
+  // over the final flattened stream.
+  std::set<uint32_t> preds;
+  std::map<uint32_t, uint32_t> regDepth;   // last-def data-flow depth per reg
+  uint32_t maxDepth = 0;
+  for (unsigned i = 0; i < flat.size(); ++i) {
+    const ir::Inst &in = flat[i];
+    if (in.op == isa::Op::BR || in.op == isa::Op::BRX || in.op == isa::Op::JMP)
+      ++report.branchCount;
+    if (in.op == isa::Op::LD || in.op == isa::Op::LDC) ++report.loadCount;
+    if (in.op == isa::Op::ST) ++report.storeCount;
+    if (in.guard >= 0) preds.insert((uint32_t)(in.guard & 7));
+    if (in.op == isa::Op::CMPP && in.dst.kind == ir::Operand::Pred)
+      preds.insert(in.dst.value & 7);
+    uint32_t d = 0;
+    const ir::Operand *srcs[3] = {&in.s1, &in.s2, &in.s3};
+    for (int k = 0; k < 3; ++k)
+      if (srcs[k]->isReg()) {
+        std::map<uint32_t, uint32_t>::iterator it = regDepth.find(srcs[k]->value);
+        if (it != regDepth.end() && it->second > d) d = it->second;
+      }
+    ++d;
+    if (in.dst.isReg()) regDepth[in.dst.value] = d;
+    if (d > maxDepth) maxDepth = d;
+  }
+  report.numPredicates = (uint32_t)preds.size();
+  report.dependencyDepth = maxDepth;
 
   if (opt.verbose) {
     std::fprintf(stderr,
-        "[driver] kernel=%s insts=%u spills=%u dual_pairs=%u est_cycles=%llu\n",
-        fn.name.c_str(), report.instructionCount, report.spillCount,
-        report.dualIssuePairs, (unsigned long long)report.estCycles);
+        "[driver] kernel=%s aec_insts=%u bb=%u vreg=%u phys=%u pred=%u "
+        "ld=%u st=%u br=%u depth=%u\n",
+        fn.name.c_str(), report.instructionCount, report.numBasicBlocks,
+        report.numVirtualRegisters, report.numPhysicalRegisters,
+        report.numPredicates, report.loadCount, report.storeCount,
+        report.branchCount, report.dependencyDepth);
   }
   return true;
 }

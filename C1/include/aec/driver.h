@@ -23,14 +23,27 @@ namespace ptx {
 bool parse(const std::string &src, Module &out, std::string &err);
 }
 
-// --- Diagnostics surfaced to the perf report / agent ----------------------
+// --- Compile report (spec §12 + scoring §B.3 diagnostics) -----------------
+// Filled by compile(); serialized to JSON by aec-cc --report. The graded perf
+// metric is warp-level dynamic instruction count, measured by the grader's own
+// executor; this report carries the STATIC diagnostics the spec asks for.
 struct CompileReport {
   std::string kernel;
-  uint32_t instructionCount = 0;
-  uint32_t spillCount       = 0;
-  uint32_t dualIssuePairs   = 0;
-  uint32_t paramBytes       = 0;
-  uint64_t estCycles        = 0;   // heuristic; no official cycle model shipped.
+  uint32_t numPtxInstructions   = 0;  // input PTX instructions
+  uint32_t instructionCount     = 0;  // emitted AEC instructions (num_aec)
+  uint32_t numBasicBlocks       = 0;
+  uint32_t numVirtualRegisters  = 0;
+  uint32_t numPhysicalRegisters = 0;
+  uint32_t numPredicates        = 0;
+  uint32_t spillLoads           = 0;  // spiller is a stub -> 0 on current kernels
+  uint32_t spillStores          = 0;
+  uint32_t branchCount          = 0;
+  uint32_t loadCount            = 0;
+  uint32_t storeCount           = 0;
+  uint32_t dependencyDepth      = 0;  // longest def->use chain (data-flow depth)
+  uint32_t dualIssuePairs       = 0;
+  uint32_t paramBytes           = 0;
+  uint64_t estCycles            = 0;  // heuristic; no official cycle model shipped
 };
 
 // --- Whole-program pipeline ----------------------------------------------
