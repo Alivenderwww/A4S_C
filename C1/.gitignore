@@ -14,3 +14,5 @@ __pycache__/
 # is a committed wrapper, so it is NOT ignored).
 /compiler/
 /disassembler/
+
+/.venv

@@ -33,9 +33,10 @@ sys.path.insert(0, os.path.join(C1, "sim"))
 # (reuse wants full unroll U16 -> 448c, poly wants U4 -> 784c; over-unrolling
 # poly to U16 regresses to 816c), which is exactly what makes the agent useful.
 # sched_window was measured to be inert on these kernels (win16==win32==win64),
-# so it is not swept.
+# so it is not swept. -O0 is NOT a candidate: it is the un-optimized baseline
+# and never the right thing to ship (dropping it also avoids a stray est_cycles
+# tie letting the agent pick it).
 CONFIGS = [
-    ("O0",         ["-O0"]),
     ("O2",         ["-O2"]),                            # default: unroll U4
     ("O3",         ["-O3"]),                            # aggressive: unroll U8
     ("O3-u16",     ["-O3", "--unroll-factor", "16"]),   # full unroll (reuse floor)
@@ -43,6 +44,13 @@ CONFIGS = [
     ("O2-no-licm", ["-O2", "--no-licm"]),               # ablation lever
 ]
 DEFAULT_CONFIG = "O2"     # the compiler default (-O2); the agent tunes UP from it.
+
+# Only switch away from the default when the predicted gain clears this margin.
+# The cycle proxy (sim for known kernels, else the compiler's est_cycles) is
+# accurate to a few percent, so small "improvements" are noise -- acting on them
+# risks a real regression (e.g. est ranks poly's U16 ~6% better but it is
+# actually 4% worse). A confident 10% gate keeps only trustworthy wins.
+SWITCH_MARGIN = 0.10
 
 
 def tool(name):
@@ -134,7 +142,11 @@ def main():
         sys.stderr.write("agent: no correct configuration\n"); return 1
 
     default = next((r for r in results if r["config"] == DEFAULT_CONFIG), correct[0])
-    best = min(correct, key=lambda r: r["cycles"])
+    # Deviate from the default only for a gain that clears SWITCH_MARGIN; among
+    # those, take the fastest. Otherwise keep the default (never regress on noise).
+    contenders = [r for r in correct
+                  if r["cycles"] < default["cycles"] * (1.0 - SWITCH_MARGIN)]
+    best = min(contenders, key=lambda r: r["cycles"]) if contenders else default
 
     # Re-emit the winner and verify it.
     final_rep = os.path.join(outdir, "final.json")

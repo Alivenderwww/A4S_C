@@ -9,6 +9,7 @@
 #include "aec/passes.h"
 #include "aec/isa.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -49,6 +50,138 @@ uint32_t paramBlockBytes(const ir::Function &fn) {
     if (end > bytes) bytes = end;
   }
   return bytes;
+}
+
+// --- Latency-aware static cycle estimate (drives the Agent's config choice) --
+//
+// The old estimate summed a per-instruction cost, which is ANTI-correlated with
+// real cycles for latency-bound loops: unrolling ADDS instructions, so it made
+// -O3 look worse than -O0 and the agent picked the slowest config. This model
+// instead, per block, computes a latency-weighted critical-path makespan via a
+// scoreboard over the (already scheduled) order, and multiplies a counted
+// self-loop's body by its trip count. Unrolling then wins correctly: fewer loop
+// iterations + overlapped independent loads -> lower estimate. Mirrors the
+// sim's cycle model (sched/list_sched.cpp latencyOf) so static ranking tracks
+// the simulator. Computed pre-regalloc, on vregs (so LOADI constants are
+// unique and self-loop trips are recoverable).
+
+int estLatency(const ir::Inst &in) {   // cycles until the result is ready
+  switch (in.op) {
+    case ir::Op::LD:
+      return (in.modifier == (uint32_t)isa::Space::GMEM ||
+              in.modifier == (uint32_t)isa::Space::LMEM) ? 32 : 2;
+    case ir::Op::TMUL: case ir::Op::TMUL_S: return 16;
+    case ir::Op::TLDA: case ir::Op::TSTA: return 6;
+    case ir::Op::DIV: case ir::Op::RCP: case ir::Op::RSQ: case ir::Op::SQRT:
+    case ir::Op::SIN: case ir::Op::COS: case ir::Op::EXP: case ir::Op::LOG:
+      return 12;
+    default: return 1;
+  }
+}
+
+// Value of a vreg if it is defined by exactly one LOADI immediate.
+bool loadiConst(const ir::Function &fn, uint32_t reg, uint32_t &val) {
+  int found = 0;
+  for (unsigned b = 0; b < fn.blocks.size(); ++b)
+    for (unsigned i = 0; i < fn.blocks[b].insts.size(); ++i) {
+      const ir::Inst &in = fn.blocks[b].insts[i];
+      if (in.op == ir::Op::LOADI && in.dst.kind == ir::Operand::Reg &&
+          in.dst.value == reg && in.hasImm) { val = in.imm; ++found; }
+    }
+  return found == 1;
+}
+
+// Exact trip of a constant single-block self-loop (role-based, so it survives
+// scheduling reorder). Returns 0 = UNKNOWN (not a recognizable constant loop);
+// a fully-unrolled loop legitimately returns 1, which must be distinct from
+// unknown so the caller does not fall back to a default trip and over-weight it.
+uint32_t blockTrip(const ir::Function &fn, const ir::BasicBlock &b, unsigned bi) {
+  bool self = false;
+  for (unsigned s = 0; s < b.succ.size(); ++s) self |= (b.succ[s] == (int)bi);
+  if (!self || b.insts.empty()) return 0;
+  const ir::Inst &term = b.insts.back();
+  if (term.op != ir::Op::BRX || term.guard < 0) return 0;
+  const uint32_t pg = (uint32_t)(term.guard & 0x7);
+  const ir::Inst *cmp = 0;
+  for (unsigned i = 0; i < b.insts.size(); ++i) {
+    const ir::Inst &in = b.insts[i];
+    if (in.op == ir::Op::CMPP && in.dst.kind == ir::Operand::Pred &&
+        (in.dst.value & 0x7) == pg) cmp = &in;
+  }
+  if (!cmp || cmp->s1.kind != ir::Operand::Reg || cmp->s2.kind != ir::Operand::Reg)
+    return 0;
+  uint32_t bound = 0, step = 0;
+  if (!loadiConst(fn, cmp->s2.value, bound)) return 0;
+  bool haveStep = false;
+  for (unsigned i = 0; i < b.insts.size(); ++i) {
+    const ir::Inst &in = b.insts[i];
+    if (in.op == ir::Op::ADD && in.dst.kind == ir::Operand::Reg &&
+        in.dst.value == cmp->s1.value && in.s1.kind == ir::Operand::Reg &&
+        in.s1.value == cmp->s1.value && in.s2.kind == ir::Operand::Reg)
+      haveStep = loadiConst(fn, in.s2.value, step);
+  }
+  if (!haveStep || step == 0 || bound == 0) return 0;
+  uint32_t t = bound / step;
+  return t < 1 ? 1 : t;
+}
+
+// Latency-aware makespan of one block: max of the dependency critical path
+// (scoreboard) and a 2-wide dual-issue bound.
+uint64_t blockMakespan(const ir::BasicBlock &b) {
+  const uint32_t PRED_NS = 0x10000u;
+  std::map<uint32_t, int> ready;   // reg / predicate -> cycle result available
+  int critical = 0;
+  for (unsigned i = 0; i < b.insts.size(); ++i) {
+    const ir::Inst &in = b.insts[i];
+    int t = 0;
+    const ir::Operand *s[3] = {&in.s1, &in.s2, &in.s3};
+    for (int k = 0; k < 3; ++k)
+      if (s[k]->kind == ir::Operand::Reg) {
+        std::map<uint32_t, int>::iterator it = ready.find(s[k]->value);
+        if (it != ready.end()) t = std::max(t, it->second);
+      }
+    if (in.guard >= 0) {
+      std::map<uint32_t, int>::iterator it = ready.find(PRED_NS | (uint32_t)(in.guard & 0x7));
+      if (it != ready.end()) t = std::max(t, it->second);
+    }
+    int done = t + estLatency(in);
+    if (in.dst.kind == ir::Operand::Reg) ready[in.dst.value] = done;
+    else if (in.dst.kind == ir::Operand::Pred)
+      ready[PRED_NS | (in.dst.value & 0x7)] = done;
+    critical = std::max(critical, done);
+  }
+  uint64_t issueBound = (b.insts.size() + 1) / 2;   // 2-wide dual issue
+  return std::max<uint64_t>((uint64_t)critical, issueBound);
+}
+
+uint64_t estimateCyclesIR(const ir::Function &fn) {
+  const unsigned nb = fn.blocks.size();
+  const uint64_t DEFAULT_TRIP = 32;   // representative trip for an unknown bound
+  // Per-block loop multiplier. A successor edge to an index <= the current
+  // block is a back-edge (our CFGs are reducible); weight every block in the
+  // loop body [header..tail] by the trip so a hot loop body dominates the
+  // estimate. Without this, a multi-block / param-trip loop (e.g. GEMM's
+  // K-loop) is counted once and -O0's bloated body looks as cheap as -O2's
+  // optimized one -> the agent would wrongly pick -O0. A constant single-block
+  // self-loop uses its exact trip; anything else uses DEFAULT_TRIP. Nested
+  // loops compound (product), which is what we want.
+  std::vector<uint64_t> mult(nb, 1);
+  for (unsigned bi = 0; bi < nb; ++bi)
+    for (unsigned s = 0; s < fn.blocks[bi].succ.size(); ++s) {
+      int hdr = fn.blocks[bi].succ[s];
+      if (hdr < 0 || hdr > (int)bi) continue;                // forward edge
+      // Exact trip for a recognizable constant single-block self-loop (blockTrip
+      // returns the real count, incl. 1 for a fully-unrolled loop); DEFAULT_TRIP
+      // when the bound is unreadable (0 = unknown: multi-block, or a param trip
+      // like GEMM's K-loop), which must NOT leave the hot body unweighted.
+      uint32_t ct = (hdr == (int)bi) ? blockTrip(fn, fn.blocks[bi], bi) : 0;
+      uint64_t trip = (ct >= 1) ? (uint64_t)ct : DEFAULT_TRIP;
+      for (int i = hdr; i <= (int)bi; ++i) mult[(unsigned)i] *= trip;
+    }
+  uint64_t total = 0;
+  for (unsigned bi = 0; bi < nb; ++bi)
+    total += blockMakespan(fn.blocks[bi]) * mult[bi];
+  return total;
 }
 
 void runOptPasses(ir::Function &fn, const Options &opt) {
@@ -125,6 +258,7 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
   if (opt.gemm_tmul) codegen::lowerGemmToTmul(fn, opt);
   if (opt.unroll) passes::unrollLoops(fn, opt);   // expose independent loads (-O3).
   sched::listSchedule(fn, opt);   // pre-RA: schedule on vregs (fewer false deps).
+  const uint64_t estCycles = estimateCyclesIR(fn);   // pre-RA: vregs unique.
   regalloc::linearScan(fn, opt);
 
   std::vector<ir::Inst> flat = codegen::lower(fn, opt);
@@ -169,7 +303,7 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
   report.spillCount = fn.regs.spillCount;
   report.dualIssuePairs = fn.dualIssuePairs;
   report.paramBytes = pbytes;
-  report.estCycles = estimateCycles(image);
+  report.estCycles = estCycles;   // latency-aware, computed pre-regalloc.
 
   if (opt.verbose) {
     std::fprintf(stderr,
