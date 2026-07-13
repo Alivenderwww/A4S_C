@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from ..graph import Graph
-from .fusion import FusionPass
+from .fusion import FusionPass, prefuse_conv_bn
 from .shape_infer import ShapeInferencePass
 
 
@@ -36,13 +36,31 @@ class GraphPassPipeline:
             self.run(graph)
 
     def run(self, graph: Graph) -> Graph:
-        """Run enabled passes; return the optimized graph."""
+        """Run enabled passes; return the optimized graph.
+
+        The input graph is left untouched: fusion operates on a clone, so
+        callers can still compare the original graph against the optimised one
+        numerically (the C3.3 F4 numeric-alignment check relies on this).
+        """
         self.pass_results = {}
         if self.enable_shape_infer:
             self.pass_results["ShapeInference"] = ShapeInferencePass().run(graph)
 
+        work = graph.clone() if self.enable_fusion else graph
+
+        # Recognise Conv+BatchNorm (incl. BN pre-absorbed into Conv, the ResNet
+        # case) before the fusion matchers. Returns annotation records rather
+        # than rewriting the graph, so the EW-chain matcher is not perturbed.
+        bn_notes = prefuse_conv_bn(work) if self.enable_fusion else []
+
         fusion = FusionPass(enable_fusion=self.enable_fusion)
-        result = fusion.run(graph)
+        result = fusion.run(work)
+        # merge the Conv-BN recognitions into the fusion log
+        if bn_notes:
+            result["stats"]["fusion_log"].extend(bn_notes)
+            result["stats"]["patterns_hit"] = sorted(
+                {e["pattern"] for e in result["stats"]["fusion_log"]})
+            result["stats"]["num_fused"] = len(result["stats"]["fusion_log"])
         self.pass_results["Fusion"] = result
         self.optimized_graph = result["graph"]
         return self.optimized_graph

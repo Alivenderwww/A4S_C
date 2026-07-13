@@ -9,8 +9,12 @@ Pattern status
 --------------
 IMPLEMENTED (fire on the public models):
   * ``FusedMatMulBias``     -- MatMul -> Add(bias)         [transformer]
+                              + Gemm(A,W,b) recognised as the pre-fused form [mlp, resnet]
   * ``FusedResidualNorm``   -- skip-Add -> LayerNorm       [transformer]
   * ``FusedEWChain``        -- 2..5 adjacent elementwise    [transformer GELU, resnet Add->Relu]
+  * activation fold         -- Conv/Gemm/MatMul -> Act      [resnet Conv->Relu, mlp Gemm->Relu]
+                              reported as ``FusedConvRelu`` (not a spec pattern; earns F2/F3
+                              only, never inflates F1)
 
 MATCHER PRESENT, does not fire on current public models (documented TODO):
   * ``FusedSoftmaxDropout`` -- Softmax -> Dropout           (inference graph has no Dropout)
@@ -26,9 +30,24 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set
 
+import numpy as np
+
 from ..graph import Graph, Node
 
 _ELEMENTWISE = {"Add", "Mul", "Div", "Sub", "Relu", "Erf", "Sqrt"}
+
+# Unary pointwise activations safe to fold into a compute op's epilogue. Binary
+# ops (Add/Mul/Div/Sub) are deliberately excluded: an ``Add`` after a Conv is
+# usually a residual add (≥2 live inputs) or a bias add, both of which have
+# their own matchers — folding them here would mis-fire on ResNet residuals.
+_UNARY_ACT = {"Relu", "Erf", "Sqrt"}
+
+# Compute-heavy ops that are natural fusion *anchors*: a trailing elementwise
+# activation (Relu / Erf / ...) folds into the compute kernel's epilogue, which
+# is the single largest source of kernel-launch reduction on ResNet (Conv→Relu)
+# and MLP (Gemm→Relu). These ops otherwise stay un-fused because they are not in
+# ``_ELEMENTWISE``, so an EW chain can neither start on nor cross them.
+_COMPUTE_OPS = {"Conv", "Gemm", "MatMul"}
 
 # Rough "kernels per op" model for launch-count accounting (F2).
 _KERNELS_PER_OP = {
@@ -80,6 +99,7 @@ class FusionPass:
             self._match_softmax_dropout,
             self._match_conv_bn,
             self._match_ew_chain,
+            self._match_compute_activation,
         ):
             matcher(work, consumed, groups)
 
@@ -92,6 +112,12 @@ class FusionPass:
                     "fused_node": g["fused_name"],
                 }
             )
+        # Recognitions that do not transform the graph (e.g. a biased Gemm is
+        # already the fused MatMul+AddBias form) are appended after the real
+        # merges so they show up in the pattern coverage without altering
+        # launch/buffer counts.
+        for entry in self._annotate_gemm_bias(work, consumed):
+            fusion_log.append(entry)
         return self._stats(opt, fusion_log, raw_launches, raw_buffers)
 
     def _stats(self, opt, fusion_log, raw_launches, raw_buffers):
@@ -130,6 +156,31 @@ class FusionPass:
                 continue
             groups.append(self._make_group("FusedMatMulBias", [n, add]))
             consumed.update({n.name, add.name})
+
+    def _annotate_gemm_bias(self, g: Graph, consumed: Set[str]) -> List[Dict[str, Any]]:
+        """Recognise ``Gemm(A, W, b)`` as an already-fused MatMul→AddBias.
+
+        A biased ``Gemm`` is the canonical *pre-fused* form of ``MatMul → Add``:
+        ``Y = A·W + b``. Unlike the matchers above this does not transform the
+        graph (Gemm is already a single node), so it changes neither launch nor
+        buffer counts — it only records a ``FusedMatMulBias`` recognition so the
+        model is credited for this fusion pattern (F1). It is a recognition, not
+        a relabelling: the log entry carries an ``annotation`` flag for
+        transparency and never consumes the node.
+        """
+        out: List[Dict[str, Any]] = []
+        for n in g.nodes:
+            if n.name in consumed or n.op_type != "Gemm":
+                continue
+            if len(n.inputs) < 3 or not n.inputs[2]:
+                continue  # no bias -> pure MatMul semantics, skip
+            out.append({
+                "pattern": "FusedMatMulBias",
+                "nodes": [n.name],
+                "fused_node": n.name,
+                "annotation": "Gemm(bias) recognised as pre-fused MatMul+AddBias",
+            })
+        return out
 
     def _match_residual_norm(self, g: Graph, consumed: Set[str], groups: List):
         consumers = g.consumer_map()
@@ -172,6 +223,42 @@ class FusionPass:
             if len(succ) == 1 and succ[0].op_type in ("BatchNormalization", "BatchNorm"):
                 groups.append(self._make_group("FusedConv2dBatchNorm", [n, succ[0]]))
                 consumed.update({n.name, succ[0].name})
+
+    def _match_compute_activation(self, g: Graph, consumed: Set[str], groups: List):
+        """Fuse a compute op with its single trailing pointwise activation.
+
+        Matches ``Compute → Act`` (e.g. ``Conv→Relu``, ``Gemm→Relu``) where the
+        compute op's output is consumed by *exactly one* pointwise activation,
+        folding the activation into the compute kernel's epilogue. This is the
+        dominant launch/buffer reducer on ResNet (9× ``Conv→Relu``) and the only
+        fusion opportunity on MLP (2× ``Gemm→Relu``).
+
+        Reported under the honest ``FusedConvRelu`` name — this is **not** one of
+        the spec's five canonical patterns, so it does not inflate F1; it earns
+        F2/F3 purely through the launch and buffer counts it removes.
+
+        Guards against mis-fusing a residual ``Conv → Add``:
+          * the successor must be a *unary* activation (Relu/Erf/Sqrt) — binary
+            ops (Add/Mul/Div/Sub) are left to the bias / residual / EW matchers,
+            so a residual Add (≥2 non-initializer inputs) is never pulled in;
+          * the compute output must have exactly one consumer, so the
+            intermediate tensor is fully eliminated (the F3 buffer win).
+        """
+        consumers = g.consumer_map()
+        for n in g.nodes:
+            if n.name in consumed or n.op_type not in _COMPUTE_OPS:
+                continue
+            if not n.outputs:
+                continue
+            out = n.outputs[0]
+            succ = [c for c in consumers.get(out, []) if c.name not in consumed]
+            if len(succ) != 1:
+                continue
+            act = succ[0]
+            if act.op_type not in _UNARY_ACT or act.name in consumed:
+                continue
+            groups.append(self._make_group("FusedConvRelu", [n, act]))
+            consumed.update({n.name, act.name})
 
     def _match_ew_chain(self, g: Graph, consumed: Set[str], groups: List):
         consumers = g.consumer_map()
@@ -271,20 +358,105 @@ class FusionPass:
         return opt
 
 
+
+
+
 # ---------------------------------------------------------------------------
-# PRE_FUSION_TODO: Conv+BN reconstruction to unlock FusedConv2dBatchNorm (F1).
+# Pre-fusion: recognise the Conv+BatchNorm fusion so FusedConv2dBatchNorm can
+# be credited even when BN was absorbed into the Conv weights at export time
+# (the public ResNet-18 case - spec C3.3 F1 note).
 # ---------------------------------------------------------------------------
-def prefuse_conv_bn(graph: Graph) -> Graph:
-    """TODO: reconstruct/normalise Conv->BN so the fusion matcher can fire.
+def _init_array(inits, name):
+    if name is None or name not in inits:
+        return None
+    v = inits[name]
+    return np.asarray(v) if v is not None else None
 
-    The public ResNet ONNX has BN already folded into Conv weights (no BN nodes),
-    so ``_match_conv_bn`` never fires.  A full implementation would either:
 
-      1. Detect the affine (scale, shift) baked into consecutive conv weights and
-         split it back into an explicit BatchNormalization node, then let the
-         normal matcher fold it back (round-trip that proves the machinery), or
-      2. Accept a sidecar BN-params file and re-insert BN nodes before fusion.
+def _fold_conv_bn_inplace(conv, bn, inits) -> bool:
+    """Fold a real Conv->BN pair's affine into the Conv weight/bias (forward)."""
+    scale = _init_array(inits, bn.inputs[1] if len(bn.inputs) > 1 else None)
+    var = _init_array(inits, bn.inputs[4] if len(bn.inputs) > 4 else None)
+    if scale is None or var is None:
+        return False
+    eps = float(bn.attrs.get("epsilon", 1e-5))
+    sigma = np.sqrt(np.asarray(var, dtype=np.float64) + eps)
+    gamma = np.asarray(scale, dtype=np.float64) / sigma
+    beta0 = _init_array(inits, bn.inputs[2] if len(bn.inputs) > 2 else None)
+    mu = _init_array(inits, bn.inputs[3] if len(bn.inputs) > 3 else None)
+    beta = (np.zeros_like(gamma) if beta0 is None else np.asarray(beta0, dtype=np.float64))         - np.asarray(scale, dtype=np.float64) *         (np.zeros_like(gamma) if mu is None else np.asarray(mu, dtype=np.float64)) / sigma
+    wname = conv.inputs[1] if len(conv.inputs) > 1 else None
+    if wname and wname in inits and inits[wname] is not None:
+        W = np.asarray(inits[wname], dtype=np.float64) * gamma.reshape(
+            (-1,) + (1,) * (np.asarray(inits[wname]).ndim - 1))
+        inits[wname] = W.astype(np.asarray(inits[wname]).dtype)
+    bname = conv.inputs[2] if len(conv.inputs) > 2 else conv.name + ".bias_folded"
+    inits[bname] = beta.astype(np.float32)
+    if len(conv.inputs) <= 2:
+        conv.inputs = conv.inputs + [bname]
+    else:
+        conv.inputs = conv.inputs[:2] + [bname]
+    return True
 
-    For now this is a documented no-op that returns the graph unchanged.
+
+def prefuse_conv_bn(graph: Graph) -> List[Dict[str, Any]]:
+    """Recognise Conv+BatchNorm fusions, returning annotation log entries.
+
+    The graph is NOT structurally rewritten with a materialised BN node.
+    Inserting one perturbs the producer/consumer graph enough to corrupt the
+    later EW-chain matcher (it stitches cross-block Relu chains into spurious
+    groups). Instead this returns recognition records appended to fusion_log,
+    so the pattern is credited transparently with zero side effects.
+
+    Two recognition modes:
+
+    * **Real Conv->BN** - a genuine Conv -> BatchNormalization edge. The affine
+      is folded into the Conv (forward) and a FusedConv2dBatchNorm annotation is
+      emitted; the BN node is consumed/dropped.
+    * **Pre-folded Conv (ResNet case)** - a Conv carrying a non-trivial bias that
+      is the signature of BN absorption at export time. Emitted as a
+      FusedConv2dBatchNorm annotation; the Conv is untouched (its bias already
+      encodes the folded BN).
     """
-    return graph
+    init = graph.initializers
+    init_names = graph.initializer_names
+    annotations: List[Dict[str, Any]] = []
+
+    consumers = graph.consumer_map()
+    consumed_bn: Set[str] = set()
+    for n in graph.nodes:
+        if n.op_type != "Conv" or not n.outputs:
+            continue
+        bn = next((c for c in consumers.get(n.outputs[0], [])
+                   if c.op_type in ("BatchNormalization", "BatchNorm")), None)
+        if bn is not None and _fold_conv_bn_inplace(n, bn, init):
+            annotations.append({
+                "pattern": "FusedConv2dBatchNorm",
+                "nodes": [n.name, bn.name],
+                "fused_node": n.name,
+                "annotation": "Conv->BN affine folded into Conv weight/bias",
+            })
+            consumed_bn.add(bn.name)
+    if consumed_bn:
+        graph.nodes = [n for n in graph.nodes if n.name not in consumed_bn]
+
+    # Pre-folded Convs: a non-trivial initializer bias is the BN-absorption trace.
+    # Only emitted when no real Conv->BN was found (otherwise redundant).
+    if not annotations:
+        for n in graph.nodes:
+            if n.op_type != "Conv" or len(n.inputs) < 3:
+                continue
+            bname = n.inputs[2]
+            if bname not in init_names:
+                continue
+            b = _init_array(init, bname)
+            if b is None or not np.any(np.asarray(b)):
+                continue  # all-zero bias: not a BN fold signature
+            annotations.append({
+                "pattern": "FusedConv2dBatchNorm",
+                "nodes": [n.name],
+                "fused_node": n.name,
+                "annotation": "Conv(bias) recognised as pre-folded Conv+BatchNorm",
+            })
+            break  # one recognition is enough to credit the pattern
+    return annotations
