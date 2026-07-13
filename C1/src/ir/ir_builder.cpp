@@ -381,9 +381,9 @@ void Builder::translate(const ptx::Instruction &s) {
     ir::Inst in; in.op = Op::SYNC_WG; emit(in); return;
   }
 
-  // Top-level `ret` in an .entry kernel exits the thread -> AEC HALT (completes
-  // the warp). A real RET pops the call stack, which is empty at kernel level
-  // -> execution error on the golden. (The golden's own images end in HALT.)
+  // Top-level `ret` in an .entry kernel exits the thread -> AEC HALT, which
+  // per Track-B §A.2 1.1 is uniform and completes the warp. An AEC RET pops the
+  // per-warp call stack, empty at kernel level -> execution error.
   if (m == "ret") { ir::Inst in; in.op = Op::HALT; emit(in); return; }
   if (m == "exit"){ ir::Inst in; in.op = Op::HALT; emit(in); return; }
 
