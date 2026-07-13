@@ -32,7 +32,6 @@ struct Options {
   bool dce          = true;
   bool cse          = true;
   bool licm         = true;
-  bool mem_coalesce = true;
   bool pred_opt     = true;
 
   // Back-end knobs.
@@ -61,8 +60,7 @@ struct Options {
     opt = level;
     pred_opt   = true;                 // correctness: always on (see above).
     const bool o2 = (level != OptLevel::O0);   // O2/O3 performance opts.
-    const_prop = dce = cse = o2;
-    licm = mem_coalesce = o2;
+    const_prop = dce = cse = licm = o2;
     dual_issue = o2;
     // Unrolling is now a DEFAULT (-O2) optimization: it is shape-conservative
     // (only constant-trip single-block self-loops) and guarded against register

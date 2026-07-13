@@ -199,7 +199,6 @@ void runOptPasses(ir::Function &fn, const Options &opt) {
     if (opt.licm)       passes::licm(fn, opt);
     if (opt.dce)        passes::dce(fn, opt);
   }
-  if (opt.mem_coalesce) passes::memCoalesce(fn, opt);
   if (opt.pred_opt)     passes::predOpt(fn, opt);   // correctness: every level.
   buildCFG(fn); // transforms may have changed control flow.
 }

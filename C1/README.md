@@ -39,9 +39,8 @@ C1/
 │   ├── ir/cfg.cpp               CFG 构建（succ/pred）
 │   ├── passes/const_prop.cpp    常量传播          （T2）
 │   ├── passes/dce.cpp           死代码消除        （T2）
-│   ├── passes/cse.cpp           公共子表达式消除  （T2）
-│   ├── passes/licm.cpp          循环不变量外提    （T2）
-│   ├── passes/mem_coalesce.cpp  内存合并/复用     （T3）
+│   ├── passes/cse.cpp           公共子表达式消除 + 冗余 load 消除（T2/T3）
+│   ├── passes/licm.cpp          循环不变量外提 + 循环不变 load 外提（T2/T3）
 │   ├── passes/pred_opt.cpp      谓词执行优化      （T2）
 │   ├── regalloc/linear_scan.cpp 256-GPR 线性扫描分配（T4）
 │   ├── sched/list_sched.cpp     DDG + 列表调度 + 双发射配对（T4）
@@ -112,7 +111,7 @@ python3 agent/run_agent.py input.ptx -o out.aecbin --report agent_report.json
 ```
 
 `aec-cc` 支持的开关：`-O0/-O2/-O3`、`-o`、`--report`、`--sched-window N`、
-`--no-const-prop|--no-dce|--no-cse|--no-licm|--no-mem-coalesce|--no-pred-opt|--no-dual-issue|--no-gemm`、
+`--no-const-prop|--no-dce|--no-cse|--no-licm|--no-pred-opt|--no-dual-issue`、
 `--selftest`、`-v/--verbose`、`-h/--help`。
 
 ---
@@ -134,7 +133,7 @@ python3 agent/run_agent.py input.ptx -o out.aecbin --report agent_report.json
       ▼
    带 CFG 的 IR
       │  passes/*.cpp（-O2/-O3 按序执行；-O0 跳过）
-      │    const_prop → cse → licm → dce →（迭代）→ mem_coalesce → pred_opt
+      │    const_prop → cse → licm → dce →（迭代）→ pred_opt
       ▼
    优化后 IR
       │  unroll.cpp（循环展开，-O2/-O3 按选项）
@@ -242,18 +241,15 @@ CVT*（AEC 扩展 ISA，dev harness 用）：目标类型 [6:3]，源类型 [13:
   高度做 ready-list 列表调度，交织 LD/计算隐藏访存延迟并最大化双发射配对。当前仅统计相邻
   可配对数、**不重排**。
 
-### T3 — 内存优化（正确性 10、性能 9）
-- **[P2]** `src/passes/mem_coalesce.cpp`：合并同基址+仿射偏移的相邻访问为宽事务；把重复
-  load 的值保留在寄存器里复用。T3 的 `[%rd6]` 被载入两次（%f1、%f3）是典型目标。
+### T3 — 内存优化（性能 10）
+- ✅ 已实现：`cse.cpp` 直线冗余 load 消除（T3 的 `[%rd6]` 两次载入 → 复用寄存器，
+  gmem load 4→3）；`licm.cpp` 循环不变 load 外提；list 调度器提前发射 load 隐藏延迟。
+- **[P3]** 未来：128-byte 宽事务合并 / 把跨迭代复用的 load 提升到 SMEM（跨线程、复杂、低 ROI）。
 
-### T2 — 控制与标量优化（正确性 8、性能 5）
-- **[P2]** `src/passes/cse.cpp`：对纯指令做值编号并复用（T2 repeated_expression 有两条相同
-  `add.f32 %fX,%f1,%f2` + 冗余 `mul.f32 %f1,%f2`）。
-- **[P2]** `src/passes/licm.cpp`：从 CFG back-edge 识别循环，把循环不变量提升到 preheader。
-- **[P3]** `src/passes/const_prop.cpp`：LOADI 常量折叠 + 传播。
-- **[P3]** `src/passes/dce.cpp`：按 use-count 删除无副作用死指令（迭代到不动点）。
-- **[P3]** `src/passes/pred_opt.cpp`：小分支 if-conversion 成谓词直线代码（各用例尾部的
-  `@%pN bra DONE`）。
+### T2 — 控制与标量优化（性能 8）
+- ✅ 已实现：`const_prop`（LOADI 常量折叠 + 级联传播）、`cse`（块内值编号）、
+  `licm`（自然循环不变量外提）、`dce`（迭代 use-count 删死码）、`pred_opt`（边界 guard if-conversion）。
+- **[P3]** 未来：基本块合并（公开用例热点在单块内，ROI 低）。
 
 ### T1 — 基础 Lowering（正确性 4，门禁基础）
 - ✅ 已实现：special register、`mad.lo`/`mul.wide`/`add.u64` 地址计算（32-bit 折叠，

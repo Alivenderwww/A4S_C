@@ -27,9 +27,6 @@ bool dce(ir::Function &fn, const Options &opt);          // dce.cpp
 bool cse(ir::Function &fn, const Options &opt);          // cse.cpp
 bool licm(ir::Function &fn, const Options &opt);         // licm.cpp
 
-// --- GPGPU memory optimizations (scoring category T3). --------------------
-bool memCoalesce(ir::Function &fn, const Options &opt);  // mem_coalesce.cpp
-
 // --- Predicate optimization (scoring category T2). ------------------------
 bool predOpt(ir::Function &fn, const Options &opt);      // pred_opt.cpp
 
