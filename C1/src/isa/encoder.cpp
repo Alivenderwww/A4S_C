@@ -1,8 +1,8 @@
 // encoder.cpp - Bit-exact AEC instruction encoder + golden self-test.
 //
-// Implements the Track-B AEC Precise ISA (spec.md §A.1 opcodes, §3 layout /
-// Pred/Ctrl, §4 types, §5 operand placement). Verified against the Track-B
-// aec_cases program.bin vectors by selfTest().
+// Implements the C1 spec encoding (§4 opcodes, §5.1 layout, §5.2 Pred/Ctrl,
+// §5.3 types, §5.4 space). Cross-checked bit-exact against a reference AEC
+// program.bin by selfTest().
 #include "aec/isa.h"
 
 #include <cstdint>
@@ -18,7 +18,7 @@ static const uint16_t kTypeMask    = 0x000fu;
 static const uint16_t kFamilyMask  = 0x0007u;
 static const uint16_t kSpaceMask   = 0x0007u;
 
-// Track-B §4.1: these opcodes take type .none; their [6:3] field is 0xf.
+// These opcodes carry no data type; their type field [6:3] encodes .none (0xf).
 static bool isTypeless(Op op) {
   switch (op) {
     case Op::LOADI: case Op::LOADI64: case Op::BR: case Op::BRX:
@@ -35,25 +35,6 @@ bool usesImmediate(Op op, uint32_t /*memory_space*/) {
   return op == Op::LOADI || op == Op::LOADI64 || op == Op::BR ||
          op == Op::BRX || op == Op::CALL || op == Op::SSYNC ||
          op == Op::RDPMC;
-}
-
-// Tensor precision mode (Pred/Ctrl [10:8]); mode 7 uses the extended selector.
-uint8_t tensorModeForType(Type t) {
-  switch (t) {
-    case Type::F32:  return 0;
-    case Type::F16:  return 1;
-    case Type::BF16: return 2;
-    case Type::S8:   return 3;
-    case Type::F64:
-    case Type::S32:  return 7;
-    default:         return 0xffu;
-  }
-}
-
-uint8_t tensorExtendedModeForType(Type t) {
-  if (t == Type::F64) return 0;
-  if (t == Type::S32) return 1;
-  return 0;
 }
 
 Word128 encode(const Fields &f) {
@@ -78,18 +59,10 @@ Word128 encode(const Fields &f) {
     pred_ctrl |= static_cast<uint16_t>((f.modifier & kFamilyMask) << kFamilyShift);
   } else if (f.op == Op::LD || f.op == Op::ST) {
     pred_ctrl |= static_cast<uint16_t>((f.modifier & kSpaceMask) << kSpaceShift);
-  } else if (f.op == Op::TMUL || f.op == Op::TMUL_S) {
-    const uint8_t mode = tensorModeForType(f.type);
-    pred_ctrl |= static_cast<uint16_t>((mode & kFamilyMask) << kFamilyShift);
-    if (mode == 7) {
-      pred_ctrl |= static_cast<uint16_t>(tensorExtendedModeForType(f.type) << 11);
-    }
-  } else if (f.op == Op::TLDA || f.op == Op::TSTA) {
-    pred_ctrl |= static_cast<uint16_t>((f.modifier & kFamilyMask) << kFamilyShift);
   } else if (f.op == Op::CVTFF || f.op == Op::CVTFI ||
              f.op == Op::CVTIF || f.op == Op::CVTII) {
-    // Track-B §5.3: destination type in [6:3] (f.type), source type in [13:10]
-    // (f.modifier), [9:7]=0.
+    // CVT (AEC extended ISA, used by the dev harness): destination type in
+    // [6:3] (f.type), source type in [13:10] (f.modifier), [9:7]=0.
     pred_ctrl |= static_cast<uint16_t>((f.modifier & 0xfu) << 10);
   } else if (f.op == Op::MBAR) {
     pred_ctrl |= static_cast<uint16_t>((f.modifier & 0x3u) << kFamilyShift);
@@ -168,8 +141,8 @@ Word128 W(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) {
 bool selfTest() {
   Golden g[8];
 
-  // Vectors are the encoded instructions of Track-B aec_cases/cvtff, decoded
-  // from its program.bin. w = [w0, w1, w2, w3].
+  // Vectors decoded from a reference AEC program.bin (cvtff case), used as an
+  // independent bit-exact check of the C1 spec §5 encoding. w = [w0,w1,w2,w3].
 
   // LOADI.none R10, 0x100
   g[0].name = "LOADI.none R10,0x100";

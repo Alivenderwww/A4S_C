@@ -1,7 +1,7 @@
 """aec_decode.py — .aecbin parser + 128-bit AEC instruction decoder.
 
-Inverse of C1/src/isa/encoder.cpp. Opcode and type numbering follow the AEC
-Precise ISA in Track-B spec.md appendix A (§A.1 opcodes, §4 types).
+Inverse of C1/src/isa/encoder.cpp. Opcode and type numbering follow the C1
+spec (§4 opcodes, §5.3 types, §5.4 memory space).
 
 Word layout (little-endian words w0..w3):
     word3 = (opcode<<16) | pred_ctrl
@@ -22,7 +22,7 @@ golden vectors baked into encoder.cpp.
 import struct
 import sys
 
-# --- opcode numbering (Track-B §A.1, mirror of C1/include/aec/isa.h) -------
+# --- opcode numbering (C1 spec §4, mirror of C1/include/aec/isa.h) ---------
 OPCODES = {
     0x0001: "ADD", 0x0002: "SUB", 0x0003: "MUL", 0x0004: "MAD", 0x0005: "FMA",
     0x0006: "DIV", 0x0007: "NEG", 0x0008: "ABS", 0x0009: "MIN", 0x000a: "MAX",
@@ -41,7 +41,7 @@ OPCODES = {
     0x0070: "RCP", 0x0071: "RSQ", 0x0072: "SIN", 0x0073: "COS", 0x0074: "EXP",
     0x0075: "LOG", 0x0076: "SQRT", 0x0080: "RDTSC", 0x0081: "RDPMC",
 }
-# type selector -> name (Track-B §4)
+# type selector -> name (C1 spec §5.3)
 TYPES = {0x0: "b32", 0x1: "b64", 0x2: "u32", 0x3: "s32", 0x4: "u8", 0x5: "s8",
          0x8: "f32", 0x9: "f64", 0xa: "f16", 0xb: "bf16", 0xf: "none"}
 SPACES = {0: "gmem", 1: "smem", 2: "cmem", 3: "lmem", 4: "pmem"}

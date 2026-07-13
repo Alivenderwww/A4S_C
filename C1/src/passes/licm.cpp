@@ -3,8 +3,9 @@
 // STATUS: wired identity stub. Detects natural loops from the CFG back-edges
 // (a real LICM's prerequisite) but hoists nothing yet.
 //
-// PTX-02 (invariant_poly) computes `add.f32 %f5,%f1,%f2` etc. inside its LOOP
-// although %f1/%f2 are loop-invariant param values — that is the hoist target.
+// A T2 (scalar optimization) kernel that computes a loop-invariant expression
+// inside its K-loop is the hoist target: values that don't depend on the loop
+// counter can move to the preheader.
 #include "aec/passes.h"
 
 #include <map>

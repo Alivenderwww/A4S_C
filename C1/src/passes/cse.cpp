@@ -3,8 +3,8 @@
 // STATUS: wired identity stub. Builds the value key a real local-CSE would
 // hash on (opcode+type+operands of pure instructions) but performs no reuse.
 //
-// PTX-02 (invariant_poly) has two identical `add.f32 %fX, %f1, %f2` in a loop
-// body plus a redundant `mul.f32` — the intended CSE win lives there.
+// T2 (repeated_expression) has two identical `add.f32 %fX, %f1, %f2` plus a
+// redundant `mul.f32 %f1, %f2` — the intended CSE win lives there.
 #include "aec/passes.h"
 
 #include <map>

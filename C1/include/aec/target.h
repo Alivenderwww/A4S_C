@@ -11,7 +11,7 @@
 
 namespace aec {
 
-// Machine limits (from Track-B / aec_isa.h). These are hard ISA facts.
+// Machine limits (C1 spec §5.2 predicates, §8.3 registers). Hard ISA facts.
 static const unsigned kRegisterCount   = 256; // R0..R255, 32-bit each.
 static const unsigned kPredicateCount  = 8;   // P0..P7.
 static const unsigned kPredicateNone   = 15;  // "no predicate" selector.
@@ -37,7 +37,6 @@ struct Options {
 
   // Back-end knobs.
   bool dual_issue   = true;   // list scheduler pairs independent ops.
-  bool gemm_tmul    = true;   // detect GEMM idiom and lower to TMUL.
   int  sched_window = 16;     // list-scheduler lookahead (instructions).
   bool unroll       = false;  // loop unrolling (opt-in, -O3): expose ILP.
   int  unroll_factor = 4;     // unroll count for counted loops.
@@ -47,13 +46,12 @@ struct Options {
 
   // Derive the boolean pass switches from an -O level.
   //
-  // CORRECTNESS FIRST AT EVERY LEVEL. Two transforms are AEC semantic
-  // requirements, not optimizations, so they stay ON even at -O0:
-  //   gemm_tmul : GEMM idiom lowering -- must run to emit a matmul at all.
-  //   pred_opt  : if-convert divergent bounds guards. AEC has no SIMT
-  //               reconvergence, so a divergent BRX is a WRONG RESULT (not just
-  //               slow); a partial last block (N % blockDim != 0) would fault.
-  //               Gating this off at -O0 made -O0 miscompile -> instant zero.
+  // CORRECTNESS FIRST AT EVERY LEVEL. One transform is an AEC semantic
+  // requirement, not an optimization, so it stays ON even at -O0:
+  //   pred_opt : if-convert divergent bounds guards. AEC has no SIMT
+  //              reconvergence, so a divergent BRX is a WRONG RESULT (not just
+  //              slow); a partial last block (N % blockDim != 0) would fault.
+  //              Gating this off at -O0 made -O0 miscompile -> instant zero.
   // Everything else below is a pure performance choice:
   //   -O0 = correct standard codegen (perf opts off)
   //   -O2 = default: all safe perf opts on (earns the bulk of the perf score)
@@ -61,7 +59,6 @@ struct Options {
   //         window) but MUST remain correct.
   void applyOptLevel(OptLevel level) {
     opt = level;
-    gemm_tmul  = true;                 // correctness: always on.
     pred_opt   = true;                 // correctness: always on (see above).
     const bool o2 = (level != OptLevel::O0);   // O2/O3 performance opts.
     const_prop = dce = cse = o2;

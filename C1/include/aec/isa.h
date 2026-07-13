@@ -1,9 +1,10 @@
 // isa.h - AEC ISA constants + 128-bit instruction encoder/decoder.
 //
-// Encodes the AEC Precise ISA from Track-B spec.md appendix A: opcode table
-// (§A.1), 128-bit layout (§3.1), Pred/Ctrl fields (§3.2), type selectors (§4)
-// and the canonical operand/encoding matrix (§5). Verified bit-exact against
-// the Track-B aec_cases program.bin vectors by aec::isa::selfTest().
+// Encodes the AEC machine code defined by the C1 spec: opcode table (§4),
+// 128-bit layout + Pred/Ctrl fields (§5.1/§5.2), type selectors (§5.3),
+// memory space (§5.4) and special-register selectors (§5.5). The numbering is
+// independently cross-checked bit-exact against a reference AEC program.bin by
+// aec::isa::selfTest().
 #ifndef AEC_ISA_H
 #define AEC_ISA_H
 
@@ -13,7 +14,8 @@
 namespace aec {
 namespace isa {
 
-// --- Opcodes (bits 127:112), Track-B §A.1. --------------------------------
+// --- Opcodes (bits 127:112). C1 spec §4 defines the 18 emitted for the PTX
+//     subset; the rest model the broader AEC ISA for the local dev harness. --
 enum class Op : uint16_t {
   ADD = 0x0001, SUB = 0x0002, MUL = 0x0003, MAD = 0x0004, FMA = 0x0005,
   DIV = 0x0006, NEG = 0x0007, ABS = 0x0008, MIN = 0x0009, MAX = 0x000a,
@@ -42,13 +44,13 @@ enum class Op : uint16_t {
   RDTSC = 0x0080, RDPMC = 0x0081
 };
 
-// --- Type selectors (Pred/Ctrl bits 6:3), Track-B §4. ---------------------
+// --- Type selectors (Pred/Ctrl bits 6:3), C1 spec §5.3. -------------------
 enum class Type : uint8_t {
   B32 = 0x0, B64 = 0x1, U32 = 0x2, S32 = 0x3, U8 = 0x4, S8 = 0x5,
   F32 = 0x8, F64 = 0x9, F16 = 0xa, BF16 = 0xb, NONE = 0xf
 };
 
-// --- Memory space (Pred/Ctrl bits 13:11), Track-B §5.3 / §8.1. ------------
+// --- Memory space (Pred/Ctrl bits 13:11), C1 spec §5.4. -------------------
 enum class Space : uint8_t {
   GMEM = 0, SMEM = 1, CMEM = 2, LMEM = 3, PMEM = 4
 };
@@ -96,17 +98,13 @@ struct Fields {
   uint16_t src2     = 0;
   uint16_t src3     = 0;
   uint32_t imm      = 0;
-  uint32_t modifier = 0; // cmp op / mem space / tensor layout depending on op.
+  uint32_t modifier = 0; // cmp op / mem space / cvt source type, per opcode.
 };
 
 // True if word0 carries an imm32 instead of Src3 for this opcode/space.
 bool usesImmediate(Op op, uint32_t memory_space);
 
-// TMUL precision-mode helpers (Pred/Ctrl bits 10:8, with extended selector).
-uint8_t tensorModeForType(Type t);
-uint8_t tensorExtendedModeForType(Type t);
-
-// Encode one instruction. Bit-exact with the Track-B contract.
+// Encode one instruction. Bit-exact with the C1 spec §5 layout.
 Word128 encode(const Fields &f);
 
 // Human-readable mnemonic for an opcode (used by aec-objdump).

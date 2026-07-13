@@ -12,8 +12,8 @@
 // A modern GPU encodes exactly this statically (SASS stall counts / scoreboards);
 // see C1_工业界参考与知识库.md §4.
 //
-// PTX-04 (reg_schedule) interleaves independent loads with FP math specifically
-// to reward this.
+// T4 (mixed_load_compute) interleaves independent loads with FP math
+// specifically to reward this.
 #include "aec/passes.h"
 
 #include <algorithm>
@@ -26,8 +26,9 @@ namespace sched {
 
 namespace {
 
-// AEC instruction latencies (cycles until the result is available). GMEM/LMEM
-// use the external memory service (~32c, Track-B §7); on-chip spaces are 1c.
+// AEC instruction latencies (cycles until the result is available). This is a
+// scheduling heuristic, not a graded model: GMEM/LMEM use the external memory
+// service (~32c assumed); on-chip spaces are 1c.
 int latencyOf(const ir::Inst &in) {
   switch (in.op) {
     case ir::Op::LD:

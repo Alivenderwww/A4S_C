@@ -7,7 +7,7 @@
 
 - 前端：PTX 词法/语法分析 → PTX AST。
 - 中端：AST → 内部 IR（基本块 + CFG）→ 优化 pass 流水线。
-- 后端：GEMM→TMUL 降级 → 循环展开 → 列表调度(pre-RA) → 线性扫描分配 → 降级 → 128-bit 编码 → `.aecbin` 容器。
+- 后端：谓词化 if-conversion → 循环展开 → 列表调度(pre-RA) → 线性扫描分配 → 降级 → 128-bit 编码 → 裸 `.aecbin` 指令流。
 - 工具：`aec-cc`（编译器）、`aec-objdump`（反汇编器）、`agent/run_agent.py`（自动调优）。
 
 具体完成度、验证数字、风险、TODO 详见 [`../docs/C1-完成度审计.md`](../docs/C1-完成度审计.md)（工程状态唯一事实源）。
@@ -45,8 +45,7 @@ C1/
 │   ├── passes/pred_opt.cpp      谓词执行优化      （T2）
 │   ├── regalloc/linear_scan.cpp 256-GPR 线性扫描分配（T4）
 │   ├── sched/list_sched.cpp     DDG + 列表调度 + 双发射配对（T4）
-│   ├── codegen/gemm_tmul.cpp    GEMM 识别 + TMUL 降级（T5）
-│   ├── codegen/lower.cpp        末端合法化 + 展平 + 分支目标解析（T1）
+│   ├── codegen/lower.cpp        末端合法化 + 展平 + 分支目标解析（T1/T5）
 │   ├── binfmt/writer.cpp        .aecbin 序列化
 │   ├── binfmt/reader.cpp        .aecbin 解析
 │   └── driver.cpp               流水线编排 + 编码 + 反汇编 + 周期估算
@@ -138,8 +137,7 @@ python3 agent/run_agent.py input.ptx -o out.aecbin --report agent_report.json
       │    const_prop → cse → licm → dce →（迭代）→ mem_coalesce → pred_opt
       ▼
    优化后 IR
-      │  gemm_tmul.cpp（GEMM 识别 + TMUL 降级）
-      │  unroll.cpp（循环展开，-O3 按选项）
+      │  unroll.cpp（循环展开，-O2/-O3 按选项）
       │  list_sched.cpp（DDG + 列表调度 + 双发射配对，pre-RA）
       │  linear_scan.cpp（虚拟寄存器 → 物理 R1..R255）
       │  lower.cpp（展平 + 分支标签 → 绝对 PC）
@@ -177,22 +175,22 @@ word1 = Src2 / 指令专用字段
 word0 = Imm32 / Src3
 ```
 
-Pred/Ctrl 位域（Track-B spec.md §3.2）：
+Pred/Ctrl 位域（C1 spec §5.2）：
 
 | 位 | 含义 |
 |---:|---|
 | 15    | predication enable（`BRX` 不置位，谓词直接放 2:0） |
 | 14    | pred_neg |
 | 13:11 | LD/ST/ATOM memory space（gmem=0,smem=1,cmem=2,lmem=3,pmem=4）/ MBAR scope；CVT* 的源类型占 [13:10] |
-| 10:8  | 指令族 subop（CMP 比较码 / SHUF/VOTE mode / TMUL mode） |
+| 10:8  | 指令族 subop（`CMP`/`CMPP` 比较码 eq..ge） |
 | 7     | 保留（必须 0） |
 | 6:3   | 数据类型 selector（`.none` 指令为 0xf） |
 | 2:0   | 谓词 P0–P7 |
 
-类型 selector（Track-B §4）：`b32=0x0 b64=0x1 u32=0x2 s32=0x3 u8=0x4 s8=0x5 f32=0x8 f64=0x9 f16=0xa bf16=0xb none=0xf`。`0x6/0x7/0xc–0xe` 保留 —— AEC 不存在 fp8/fp4/int4 标量类型。
+类型 selector（C1 spec §5.3）：`b32=0x0 b64=0x1 u32=0x2 s32=0x3 f32=0x8 none=0xf`（PTX 子集用到的六种；`u8=0x4 s8=0x5 f64=0x9 f16=0xa bf16=0xb` 属 AEC 扩展 ISA，仅 dev harness 用）。
 比较 selector：`eq=0 ne=1 lt=2 le=3 gt=4 ge=5`。
 特殊寄存器 selector（放 Src1）：`tid.x=0x100 ntid.x=0x101 ctaid.x=0x102 nctaid.x=0x103 laneid=0x104`，y/z 分量为 0x110.. / 0x120..。
-CVT*：目标类型 [6:3]，源类型 [13:10]，[9:7]=0（Track-B §5.3）。
+CVT*（AEC 扩展 ISA，dev harness 用）：目标类型 [6:3]，源类型 [13:10]，[9:7]=0。
 
 常用指令形态：
 
@@ -206,32 +204,23 @@ CVT*：目标类型 [6:3]，源类型 [13:10]，[9:7]=0（Track-B §5.3）。
 | `LD.gmem.type Rd,[Ra]` | Src1=地址寄存器，space 在 [13:11]；`.f64` 载入用 `LD.b64` 到寄存器对 |
 | `ST.gmem.type [Ra],Rs` | Dest=0，Src1=地址，Src2=源；ST 只有 32 位，`.f64` 存储拆两条 `ST.b32` |
 
-> golden 验证：`src/isa/encoder.cpp::selfTest()` 内置 8 条向量，取自
-> `Track-B/testcases/tests/aec_cases/cvtff/program.bin`（Track-B §A.1 编码），
-> 逐位一致，可用 `bin/aec-cc --selftest` 运行。此外 12 个自包含 Track-B
-> `aec_cases` 在 `sim/` 上执行结果与其 `expected/gmem` 逐字节一致。
+> golden 验证：`src/isa/encoder.cpp::selfTest()` 内置 8 条向量，取自一份参考 AEC
+> `program.bin`（cvtff 用例），逐位一致，可用 `bin/aec-cc --selftest` 运行；
+> 解码器 `sim/aec_decode.py --selftest` 同样对这 8 条逐位校验。
 
 ---
 
-## 7. `.aecbin` 容器格式
+## 7. `.aecbin` 格式
 
-自定义、显式、小端、与主机字节序无关（见 `include/aec/binfmt.h`）：
+裸 AEC 128-bit 指令流（C1 spec §10）：无 header、无 data / relocation / symbol 段，
+`entry_pc=0`，所有 label 在编译期解析为绝对指令下标。
 
-```
-[ FileHeader 32B ]
-[ SectionEntry × sectionCount，每个 16B ]
-[ CODE   段 ]  16 × instructionCount 字节（每条 = word0..word3 小端）
-[ DATA   段 ]  参数块 / 常量原始字节
-[ RELOC  段 ]  u32 count + RelocEntry[]（每个 16B：instrIndex,kind,addend,reserved）
-[ SYMBOL 段 ]  u32 count +（u32 nameLen + name 字节 + u32 value + u32 kind）×
-```
+- 每条指令 16 字节 = `word0..word3`，小端；文件写入顺序 `w0, w1, w2, w3`（`writer.cpp`）。
+- 文件大小是 16 的非零倍数，至少一条指令。
+- 参数按 ABI 布局进 `.pmem`，运行时以 `LOADI 偏移; LD.pmem [Rtmp]` 寄存器寻址（C1 spec §7）。
 
-- FileHeader：`magic='AEC1'(0x31434541) version headerBytes sectionCount entryPC
-  instructionCount paramBytes flags`。
-- 本骨架恒定输出 4 个段：`CODE / DATA / RELOC / SYMBOL`，满足 spec.md 对必备段的要求。
-- Relocation：`RELOC_PARAM_ADDR` 表示该指令的立即数是参数块字节偏移。
-- Symbol：kind=0 为 kernel 入口，kind=1 为标签（值为绝对指令下标）。
-- ⚠️ 与 spec.md 的容器要求相对，Track-B 实际用的是 **`aecbin-raw`**（裸 128-bit 指令流，无头无段；见 `Track-B/testcases/.../build.json`），设备把裸字装 IMEM、参数走 PMEM。最终提交格式（裸流 vs 本容器）待组委会确认（P0.5-A）。
+> 反汇编器（`aec-objdump`）在内存 `Image` 里另保留符号/重定位表，仅用于带标签的
+> dump，不写入 `.aecbin`。
 
 ---
 
@@ -254,33 +243,32 @@ CVT*：目标类型 [6:3]，源类型 [13:10]，[9:7]=0（Track-B §5.3）。
   可配对数、**不重排**。
 
 ### T3 — 内存优化（正确性 10、性能 9）
-- **[P2]** `src/passes/mem_coalesce.cpp`：合并同基址+仿射偏移的相邻访问为宽事务；把循环不变
-  的重复 load 提升到 SMEM（`TLDA`）/寄存器。PTX-03 的 `[%rd5]` 每次迭代重载是典型目标。
+- **[P2]** `src/passes/mem_coalesce.cpp`：合并同基址+仿射偏移的相邻访问为宽事务；把重复
+  load 的值保留在寄存器里复用。T3 的 `[%rd6]` 被载入两次（%f1、%f3）是典型目标。
 
 ### T2 — 控制与标量优化（正确性 8、性能 5）
-- **[P2]** `src/passes/cse.cpp`：对纯指令做值编号并复用（PTX-02 有两条相同 `add.f32` +
-  冗余 `mul.f32`）。
-- **[P2]** `src/passes/licm.cpp`：从 CFG back-edge 识别循环，把不变量提升到 preheader
-  （PTX-02 的 `%f1+%f2` 在 LOOP 内却是不变量）。
+- **[P2]** `src/passes/cse.cpp`：对纯指令做值编号并复用（T2 repeated_expression 有两条相同
+  `add.f32 %fX,%f1,%f2` + 冗余 `mul.f32 %f1,%f2`）。
+- **[P2]** `src/passes/licm.cpp`：从 CFG back-edge 识别循环，把循环不变量提升到 preheader。
 - **[P3]** `src/passes/const_prop.cpp`：LOADI 常量折叠 + 传播。
 - **[P3]** `src/passes/dce.cpp`：按 use-count 删除无副作用死指令（迭代到不动点）。
 - **[P3]** `src/passes/pred_opt.cpp`：小分支 if-conversion 成谓词直线代码（各用例尾部的
   `@%pN bra DONE`）。
 
 ### T1 — 基础 Lowering（正确性 4，门禁基础）
-- **[P1]** `src/ir/ir_builder.cpp`：完善 lowering 语义正确性——
-  `mul.wide` 的 64 位结果、`add.u64` 的寄存器对（R[n]:R[n+1]）进位、`cvt` 各精度规则、
-  `@!%pN`（谓词取反）分支、`mov` 各类型；补充未覆盖 PTX 指令。
+- ✅ 已实现：special register、`mad.lo`/`mul.wide`/`add.u64` 地址计算（32-bit 折叠，
+  高 32 位恒 0，见 C1 spec §8.2）、`@%pN`/`@!%pN`（含谓词取反）分支、`mov` 各类型、
+  `ret→HALT`。5/5 公开用例 + 132 变体通过。
 - **[P3]** `src/driver.cpp`：支持多 kernel 输出（当前只发第一个 kernel）。
 
 ---
 
 ## 9. 风险提示
 
-- **无独立 golden model / cycle model**：C1 未随包提供专用参考执行/周期模型。但：
-  - Track-B `testcases/tests/aec_cases/` 提供 36 个 `program.bin` + 35 个 `expected/gmem` 执行 golden，既验编码又验执行语义（12/12 自包含用例逐字节一致）；
+- **周期模型**：评测平台不暴露固定 cycle model（组委会已明确）。C1 资料包随附 ARM
+  golden model 作正确性 oracle；本仓另有 `sim/aec_sim.py` 自建功能 oracle 交叉验证。
   - Agent 的 `est_cycles` 是编译器自带的**启发式估算**（`driver.cpp::estimateCycles`），
-    不是官方周期数。真实周期模型可用后，应替换 `agent/run_agent.py::read_cycles` 的来源。
+    仅用于在候选配置间择优，不是官方周期数。
 - **仅覆盖真实 PTX 子集**：解析器按公开用例（真实 NVIDIA PTX：`.version 7.0`/`sm_70`/
   `%tid.x`/`mad.lo.u32`/`setp`/`bra` 等）实现；未识别的指令会打 `UNHANDLED:` 标记而非报错
   （利于鲁棒性变异测试），但语义未覆盖，需按 T1 TODO 扩展。

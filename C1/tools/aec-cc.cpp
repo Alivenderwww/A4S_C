@@ -27,7 +27,7 @@ static void usage(const char *argv0) {
   std::printf(
     "usage: %s input.ptx [-O0|-O2|-O3] [-o out.aecbin] [--report r.json]\n"
     "          [--no-const-prop|--no-dce|--no-cse|--no-licm|--no-mem-coalesce\n"
-    "           |--no-pred-opt|--no-dual-issue|--no-gemm] [--sched-window N]\n"
+    "           |--no-pred-opt|--no-dual-issue] [--sched-window N]\n"
     "          [--selftest] [-v|--verbose] [-h|--help]\n", argv0);
 }
 
@@ -64,7 +64,6 @@ int main(int argc, char **argv) {
     else if (a == "--no-mem-coalesce") { opt.mem_coalesce = false; }
     else if (a == "--no-pred-opt") { opt.pred_opt = false; }
     else if (a == "--no-dual-issue") { opt.dual_issue = false; }
-    else if (a == "--no-gemm") { opt.gemm_tmul = false; }
     else if (a == "--unroll") { opt.unroll = true; }
     else if (a == "--no-unroll") { opt.unroll = false; }
     else if (a == "--unroll-factor") { if (i + 1 < argc) opt.unroll_factor = std::atoi(argv[++i]); }

@@ -1,7 +1,7 @@
 // driver.cpp - Pipeline orchestration, IR->encoding, disassembly, cycle model.
 //
 // Ties every phase together (frontend -> IR -> CFG -> passes -> regalloc ->
-// sched -> gemm/lower -> encode -> image) and provides the disassembler and a
+// sched -> lower -> encode -> image) and provides the disassembler and a
 // heuristic cycle estimate. -O0 skips the optimization passes; -O2/-O3 run
 // them in order. Register allocation, scheduling and final lowering always run
 // (they are required to produce a legal image, not optional optimizations).
@@ -256,7 +256,6 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
 
   buildCFG(fn);
   runOptPasses(fn, opt);
-  if (opt.gemm_tmul) codegen::lowerGemmToTmul(fn, opt);
   if (opt.unroll) passes::unrollLoops(fn, opt);   // expose independent loads (-O3).
   sched::listSchedule(fn, opt);   // pre-RA: schedule on vregs (fewer false deps).
   const uint64_t estCycles = estimateCyclesIR(fn);   // pre-RA: vregs unique.

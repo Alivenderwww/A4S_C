@@ -7,7 +7,7 @@
 // that cfg.cpp can wire up succ/pred.
 //
 // This is the T1 "basic lowering" surface: getting these encodings right is
-// what makes PTX-01 (vector_add) produce a correct .aecbin.
+// what makes T1 (vector_add) produce a correct .aecbin.
 #include "aec/passes.h"
 #include "aec/ptx_ast.h"
 
@@ -392,9 +392,9 @@ void Builder::translate(const ptx::Instruction &s) {
     ir::Inst in; in.op = Op::SYNC_WG; emit(in); return;
   }
 
-  // Top-level `ret` in an .entry kernel exits the thread -> AEC HALT, which
-  // per Track-B §A.2 1.1 is uniform and completes the warp. An AEC RET pops the
-  // per-warp call stack, empty at kernel level -> execution error.
+  // Top-level `ret` in an .entry kernel exits the thread -> AEC HALT (C1 spec
+  // §3.10 / §6.6: HALT terminates the current thread/lane). AEC RET would pop
+  // the per-warp call stack, empty at kernel level -> execution error.
   if (m == "ret") { ir::Inst in; in.op = Op::HALT; emit(in); return; }
   if (m == "exit"){ ir::Inst in; in.op = Op::HALT; emit(in); return; }
 

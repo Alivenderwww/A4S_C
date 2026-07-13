@@ -3,9 +3,8 @@
 // STATUS: wired identity stub. Scans loads/stores and tags candidate reuse
 // groups (consecutive loads from the same base register) but rewrites nothing.
 //
-// PTX-03 (repeated_reuse) reloads `[%rd5]` every loop iteration though the
-// address is loop-invariant, and streams `[%rd7]` — the coalescing / shared-
-// memory-cache win lives there (see spec.md 4.2 "内存合并访问").
+// T3 (repeated_global_load) loads `[%rd6]` twice into %f1 and %f3 though the
+// address and value are identical — the load-reuse / coalescing win lives there.
 #include "aec/passes.h"
 
 namespace aec {
@@ -23,8 +22,8 @@ bool memCoalesce(ir::Function &fn, const Options &opt) {
       if (in.op == ir::Op::LD) ++loads;
       if (in.op == ir::Op::ST) ++stores;
       // TODO(T3): group loads that share a base address register + affine
-      // offset into a single wide/coalesced transaction; promote invariant
-      // reused loads into SMEM via TLDA/registers; record memory_transactions.
+      // offset into a single coalesced transaction; keep invariant reused
+      // loads in registers; record memory_transactions.
       (void)in;
     }
   }

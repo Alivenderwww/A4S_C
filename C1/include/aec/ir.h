@@ -45,7 +45,7 @@ struct Inst {
   Operand  dst, s1, s2, s3;
   bool     hasImm = false;
   uint32_t imm    = 0;
-  uint32_t modifier = 0;       // cmp op / mem space / tensor layout.
+  uint32_t modifier = 0;       // cmp op / mem space / cvt source type.
   std::string target;          // branch target label (BR/BRX).
   std::string note;            // optional annotation surfaced by objdump.
 

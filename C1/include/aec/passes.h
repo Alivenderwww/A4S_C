@@ -50,8 +50,6 @@ void listSchedule(ir::Function &fn, const Options &opt); // list_sched.cpp
 
 // --- Code generation / lowering (scoring categories T1 + T5). -------------
 namespace codegen {
-// GEMM idiom detection + TMUL lowering (T5). Returns true if it rewrote fn.
-bool lowerGemmToTmul(ir::Function &fn, const Options &opt); // gemm_tmul.cpp
 // Final legalization + flatten to a linear stream, resolving branch labels
 // to absolute instruction indices. Produces the encodable instruction list.
 std::vector<ir::Inst> lower(ir::Function &fn, const Options &opt); // lower.cpp

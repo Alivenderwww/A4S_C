@@ -14,7 +14,8 @@ namespace aec {
 namespace codegen {
 
 std::vector<ir::Inst> lower(ir::Function &fn, const Options & /*opt*/) {
-  // 0. Legalize 64-bit memory ops to the Track-B legal-type matrix (§4.1/§8.2):
+  // 0. Legalize 64-bit memory ops (f64 dev-harness kernels; the C1 PTX subset
+  //    is FP32-only) to the 32-bit type set the encoder emits:
   //    LD .f64      -> LD .b64        (one op, loads the 8-byte pair {Rd,Rd+1})
   //    ST .f64/.b64 -> two ST .b32    (low word at [Ra], high word at [Ra+4])
   // ST has no 64-bit width, so the pair is stored as two 32-bit words. R0 is the

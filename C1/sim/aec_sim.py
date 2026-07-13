@@ -1,18 +1,17 @@
 """aec_sim.py — AEC functional simulator (warp-lockstep, numpy lane-vectorized).
 
-A local correctness ORACLE for C1, since the official golden/cycle model is not
-released (it is a Track-B deliverable). Executes a compiled `.aecbin` over a
-grid of threads and returns the resulting GMEM so a harness can compare against
-an independent numpy reference.
+A local correctness ORACLE for C1, used alongside the official ARM golden model
+that ships with the C1 package. Executes a compiled `.aecbin` over a grid of
+threads and returns the resulting GMEM so a harness can compare against an
+independent numpy reference.
 
 Faithful to the AEC model where it matters for these kernels:
   * 32-lane warps, lockstep PC, per-launch active mask (partial last warp).
   * 256 u32 GPR + 8 predicates per lane; GPR/pred init 0.
   * `BRX` requires a UNIFORM condition across active lanes — a divergent branch
     (e.g. an un-predicated `if (tid>=n) return;` on a partial block) raises an
-    ExecError, matching Track-B §A.2 (non-uniform BRX is an execution error).
-    This is what catches the "must if-convert the bounds guard" bug
-    (see C1_实现流程分析.md §1.3).
+    ExecError (AEC has no SIMT reconvergence). This is what catches the "must
+    if-convert the bounds guard" bug.
 
 Deliberate simplifications (documented so results are not over-trusted):
   * No cross-thread interaction is modelled beyond shared GMEM (these public
@@ -20,8 +19,8 @@ Deliberate simplifications (documented so results are not over-trusted):
   * FP is IEEE via numpy; FMA is single-rounded (float64 intermediate), MAD is
     two-rounded — so a wrong `mad.f32→MAD` mapping shows up as a mismatch.
   * Integer ADD/SUB/MUL wrap at 32 bits for any integer/bit type. LD/ST widths
-    follow the Track-B §4.1 legal-type matrix (an illegal 64-bit store is an
-    ExecError); `strict=True` additionally flags questionable arithmetic types.
+    follow the legal-type set (an illegal 64-bit store is an ExecError);
+    `strict=True` additionally flags questionable arithmetic types.
 
 This oracle validates that the compiler emits the INTENDED computation and legal
 control flow; it is not a bit-exact stand-in for the hidden golden model.
@@ -33,9 +32,9 @@ from aec_decode import load_aecbin
 W = 32  # warp size
 
 # Per-instruction result latency (cycles) for the scoreboard cycle model.
-# GMEM/LMEM loads use the 32-cycle external memory service (Track-B §7); on-chip
-# is fast; TMUL/SFU are multi-cycle. This is OUR proxy model (the official cycle
-# model is unreleased), used to measure scheduling/latency-hiding — not golden.
+# GMEM/LMEM loads use a 32-cycle external memory service; on-chip is fast;
+# SFU ops are multi-cycle. This is OUR proxy model (the graded platform exposes
+# no fixed cycle model), used to measure scheduling/latency-hiding — not golden.
 _LAT = {"TMUL": 16, "TMUL_S": 16, "TLDA": 6, "TSTA": 6, "DIV": 12,
         "RCP": 12, "RSQ": 12, "SQRT": 12, "SIN": 12, "COS": 12, "EXP": 12,
         "LOG": 12, "BR": 2, "BRX": 2, "JMP": 2}
@@ -314,7 +313,7 @@ class Sim:
             # ([13:10]). If the compiler forgets to encode the source type it
             # reads back as f32/u32 (code 0/8) and the conversion is wrong here
             # too — which is correct oracle behavior (it flags the bug rather
-            # than silently guessing f16). See C1_实现流程分析.md §1.4/§5.
+            # than silently guessing the source type).
             st = ins.src_type
 
             def read_float(reg, tn):
@@ -340,7 +339,7 @@ class Sim:
                 wr_u32(d, (v & 0xffffffff).astype(np.uint32)); return
         if op == "LD":
             if ty not in ("b32", "b64", "u32", "s32", "f32"):
-                raise ExecError("illegal LD type '.%s' (Track-B §4.1)" % ty)
+                raise ExecError("illegal LD type '.%s' (C1 spec §5.3)" % ty)
             width = 8 if ty == "b64" else 4
             addr = R[:, s1]          # byte address/offset in a register (all spaces)
             mem = {0: self.gmem, 1: smem, 3: lmem, 4: self.pmem}.get(ins.space, self.gmem)
@@ -352,7 +351,7 @@ class Sim:
             return
         if op == "ST":
             if ty not in ("b32", "u32", "s32", "f32"):
-                raise ExecError("illegal ST type '.%s' (Track-B §4.1: ST is 32-bit)" % ty)
+                raise ExecError("illegal ST type '.%s' (C1 spec §9: ST is 32-bit)" % ty)
             addr = R[:, s1]
             mem = {0: self.gmem, 1: smem, 3: lmem}.get(ins.space, self.gmem)
             self._store(mem, addr, 4, R[:, s2], em)
