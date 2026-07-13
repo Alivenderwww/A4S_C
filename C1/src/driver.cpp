@@ -256,8 +256,9 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
   buildCFG(fn);
   runOptPasses(fn, opt);
   if (opt.unroll) {
-    while (passes::loopRotate(fn, opt)) {}          // while -> do-while (enables unroll)
-    passes::unrollLoops(fn, opt);                   // expose independent loads.
+    while (passes::loopRotate(fn, opt)) {}          // while -> do-while (enables the below)
+    while (passes::strengthReduce(fn, opt)) {}      // address multiplies -> add-recurrence
+    passes::unrollLoops(fn, opt);                   // cut per-iteration loop control.
   }
   sched::listSchedule(fn, opt);   // pre-RA: schedule on vregs (fewer false deps).
   const uint64_t estCycles = estimateCyclesIR(fn);   // pre-RA: vregs unique.

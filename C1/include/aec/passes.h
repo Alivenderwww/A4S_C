@@ -34,7 +34,11 @@ bool predOpt(ir::Function &fn, const Options &opt);      // pred_opt.cpp
 //     unroller can handle them (enabling transform, T5). --------------------
 bool loopRotate(ir::Function &fn, const Options &opt);   // loop_rotate.cpp
 
-// --- Loop unrolling: expose independent loads for latency hiding (T4/T5). --
+// --- Strength reduction: replace per-iteration address multiplies with an
+//     add-recurrence induction variable (T5, dynamic-instruction-count). -----
+bool strengthReduce(ir::Function &fn, const Options &opt); // strength_reduce.cpp
+
+// --- Loop unrolling: cut loop-control instructions per iteration (T4/T5). ---
 bool unrollLoops(ir::Function &fn, const Options &opt);  // unroll.cpp
 
 } // namespace passes

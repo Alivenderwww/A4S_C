@@ -103,6 +103,19 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     if (cmp.s2.kind != ir::Operand::Reg) continue;
     const uint32_t boundReg = cmp.s2.value;
 
+    // Bail if the body has a second self-incrementing induction variable
+    // besides the counter (e.g. a strength-reduced address recurrence
+    // `ADD addr,addr,stride`). Unrolling would have to offset each such IV by
+    // c*stride per copy; not handled yet, so skip (SR already cut the body).
+    bool multiIV = false;
+    for (int i = 0; i < n - 3; ++i) {
+      const ir::Inst &in = b.insts[i];
+      if (in.op == ir::Op::ADD && in.dst.kind == ir::Operand::Reg &&
+          in.s1.kind == ir::Operand::Reg && in.s1.value == in.dst.value &&
+          in.dst.value != counter) { multiIV = true; break; }
+    }
+    if (multiIV) continue;
+
     // A constant trip that U divides needs no remainder. Otherwise (a runtime
     // bound like GEMM's K param, or a non-multiple constant) the last group has
     // fewer than U valid iterations, so copies past `bound` are predicated off.

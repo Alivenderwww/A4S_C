@@ -62,6 +62,7 @@ class Sim:
         self.max_cycles = max_cycles
         self.total_cycles = 0
         self.stall_cycles = 0    # cycles a warp waits on operand (memory) latency
+        self.total_insts = 0     # warp-level DYNAMIC instruction count (the graded metric)
         self.warps = 0
 
     # ---- memory helpers (per-lane gather/scatter) ------------------------
@@ -190,6 +191,7 @@ class Sim:
             self._exec(ins, R, P, em, special, lmem, smem)
             pc += 1
         self.total_cycles += int(clock)
+        self.total_insts += steps       # warp-level dynamic instruction count
 
     # ---- data ops --------------------------------------------------------
     def _exec(self, ins, R, P, em, special, lmem, smem):
