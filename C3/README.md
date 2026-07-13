@@ -183,19 +183,21 @@ fp8→f8，fp4→f4。
 - **TODO（拿满 F1 第 5 分）**：在 `fusion.py::prefuse_conv_bn` 实现 **Conv-BN 预融合**
   （从 conv 权重反解 scale/shift 重建 BN 节点，或读取 BN 参数旁路文件后再折叠）。
 
-### C3.4 内存规划与调度（10，Code Review）— ✅ 真实实现（A–E 全接线）
-所有逻辑在 `scheduler/memory.py`，经 `build_execution_plan(graph)` 接入执行计划：
+### C3.4 内存规划与调度（10，Code Review）— ✅ 真实实现（A–E 全接线 + 可追溯证据）
+所有逻辑在 `scheduler/memory.py`，经 `build_execution_plan(graph)` 接入执行计划，并把
+A–E 每项的命中证据写进 `plan.summary['c3d_evidence']` 供 code review 一键核对：
 
-| 项 | 实现 | 可追溯检查点 |
-|----|------|--------------|
-| A 设备内存池 + 权重预加载 | `DeviceMemoryPool.malloc/free` + `preload_weight`（H2D） | 计划步 `alloc_weight`/`h2d` |
-| B 中间张量 lifetime 复用 | `LifetimePlanner`：first/last-use → 线性扫描分配 slot | ResNet 48 张量 → 3 slot |
-| C 碎片整理 | free-list + **best-fit** + **相邻空闲块 coalesce** | `pool.reuse_hits`/`coalesce_count` |
-| D 权重预取 | 消费节点前 `prefetch_distance` 步在 copy stream 发起 H2D | 「当前层算、下一层传」 |
-| E 流级并行 | `StreamAssigner`：依赖 wave 内无关节点轮转到不同 compute stream | `num_compute_streams=2` |
+| 项 | 实现 | 可追溯检查点（实测 ResNet/Transformer） |
+|----|------|------------------------------------------|
+| A 设备内存池 + 权重预加载 | `DeviceMemoryPool.malloc/free` + `preload_weight`（H2D） | `alloc_weight`/`h2d` 步；ResNet 42 权重全上 device buffer |
+| B 中间张量 lifetime 复用 | `LifetimePlanner`：first/last-use → 线性扫描分配 slot，按**真实 shape** 推导 byte 尺寸（`_infer_shapes`） | ResNet 48 张量 → 3 slot（saved=45）；每张量按自身尺寸 alloc |
+| C 碎片整理 | free-list + **best-fit** + **相邻空闲块 coalesce** + **wave 边界 defragment()** | `pool.reuse_hits`/`coalesce_count`/`defrag_runs`；Transformer defrag 触发 52 次 |
+| D 权重预取 | 层 L 的权重 H2D 在 copy stream 发起，位于**前一层 compute 之后**（非首个 kernel 前 bulk）；`prefetch_distance=2` | `interleaved_ratio`：ResNet=0.905（42 个 h2d 中 38 个与 compute 交错，bulk 仅 4） |
+| E 流级并行 | `StreamAssigner`：依赖 wave 内无关节点轮转到不同 compute stream（stream 0 = copy） | `compute_streams_used=[1,2]`，Transformer 9 个多流 wave |
 
-> TODO：中间张量精确尺寸依赖完整形状推理（当前用名义 256KB slot）；替换
-> `DeviceMemoryPool._backend` 为 `cudaMalloc/cudaMemcpyAsync` 即可对接真实设备。
+> shape 推理覆盖 spec 的 17 个算子（`_infer_shapes` + `_shape_for_op`），中间张量 byte 尺寸
+> 由 batch 推导，使 best-fit/defrag 在真实大小分布上工作。
+> 替换 `DeviceMemoryPool._backend` 为 `cudaMalloc/cudaMemcpyAsync` 即可对接真实设备。
 
 ### C3.5 典型模型部署（50）— ✅ 已实现（正确性优先）
 - onnxruntime（CUDA→CPU EP）→ `onnx.reference` 三级回退；fp32 保证过 1e-3 门槛；
@@ -224,4 +226,4 @@ fp8→f8，fp4→f4。
 2. **C3.3 Conv-BN 预融合**（F1 第 5 分 + F2/F3 提升）：`fusion.py::prefuse_conv_bn`。
 3. **C3.3 F2/F3 缩减**（各 3 分）：扩大融合覆盖（更多 EW 链 / bias 折叠）以逼近 60% 缩减锚点。
 4. **C3.2 D3 中间张量比率**（≤3 分）：为 movement 类算子补充 shape-aware 中间张量或调整口径。
-5. **C3.4 形状推理接线**（B/C 更精确）：`shape_infer.py` 传播每个中间张量精确尺寸，替换名义 slot。
+5. ~~**C3.4 形状推理接线**~~ ✅ 已完成：`memory.py::_infer_shapes` 覆盖 17 算子，中间张量按真实 byte 尺寸走 pool malloc/free，best-fit/defrag 已在真实分布上触发。
