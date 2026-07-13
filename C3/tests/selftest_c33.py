@@ -40,10 +40,20 @@ from scheduler.graph_passes.pipeline import GraphPassPipeline
 from scheduler.graph_passes.fusion import FusionPass
 from runtime.mock_runtime import MockRuntime
 
-# 公开模型根目录 (官方评测使用的 mlp + resnet)
-_MODELS_DIR = os.path.normpath(os.path.join(
-    _C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest", "Track-C",
-    "C3-scheduler", "testcases", "release_to_competitors", "models"))
+# 公开模型根目录: 优先 repo 布局 (public/...), 回退服务器平铺布局 (C3_ROOT/*.onnx)
+def _resolve_models_dir():
+    repo = os.path.normpath(os.path.join(
+        _C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest", "Track-C",
+        "C3-scheduler", "testcases", "release_to_competitors", "models"))
+    if os.path.isdir(repo):
+        return repo
+    if any(f.endswith(".onnx") for f in os.listdir(_C3_ROOT)
+           if os.path.isfile(os.path.join(_C3_ROOT, f))):
+        return _C3_ROOT
+    return repo
+
+
+_MODELS_DIR = _resolve_models_dir()
 _MODELS = {
     "mnist_mlp": ("mlp_v1.onnx", "input", np.float32, (2, 1, 28, 28)),
     "cifar_resnet18": ("resnet_v1.onnx", "input", np.float32, (2, 3, 32, 32)),

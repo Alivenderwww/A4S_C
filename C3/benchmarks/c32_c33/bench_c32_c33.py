@@ -37,11 +37,27 @@ from scheduler import import_onnx_graph, strategy, hardware, GraphPassPipeline
 from scheduler.graph_passes.fusion import FusionPass
 from runtime.mock_runtime import MockRuntime
 
-# public-model locations (relative to repo)
-_MODELS_DIR = os.path.join(
-    _C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest", "Track-C", "C3-scheduler",
-    "testcases", "release_to_competitors", "models",
-)
+# public-model locations: try the repo layout (public/...) first, then the
+# flat server layout (models sit next to C3/). The grader's model directory is
+# not guaranteed to match the dev layout, so resolve defensively.
+def _resolve_models_dir():
+    candidates = [
+        # repo layout: C3/../public/Agentic4SystemSummerSchoolContest/.../models
+        os.path.join(_C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest",
+                     "Track-C", "C3-scheduler", "testcases", "release_to_competitors", "models"),
+        # server/flat layout: models directly under C3_ROOT (e.g. ~/A4S/c3/*.onnx)
+        _C3_ROOT,
+        # C3_ROOT/models
+        os.path.join(_C3_ROOT, "models"),
+    ]
+    for d in candidates:
+        if os.path.isdir(d) and any(f.endswith(".onnx") for f in os.listdir(d)):
+            return os.path.normpath(d)
+    # fall back to the canonical repo path (will error clearly if still missing)
+    return os.path.normpath(candidates[0])
+
+
+_MODELS_DIR = _resolve_models_dir()
 MODEL_FILES = {
     "mnist_mlp": "mlp_v1.onnx",
     "cifar_resnet18": "resnet_v1.onnx",
