@@ -39,13 +39,16 @@ def wpath(p):
     return subprocess.check_output(["wslpath", "-w", p]).decode().strip() if WIN else p
 
 
-def compile_ptx(name, src, opt="-O0"):
+def compile_ptx(name, src, opt="-O0", extra_env=None):
     ptx = os.path.join(SCRATCH, name + ".ptx")
     aec = os.path.join(SCRATCH, name + ".aecbin")
     with open(ptx, "w") as f:
         f.write(src)
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     r = subprocess.run([AECCC, wpath(ptx), opt, "-o", wpath(aec)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=env)
     return (aec, None) if r.returncode == 0 else (None, r.stderr.strip())
 
 
@@ -156,6 +159,9 @@ def main():
     print("== bounds guard on a partial last block (real OOB divergence) ==")
     _partial_block()
 
+    print("== unroll correctness regressions (official CModel differential) ==")
+    _unroll_regressions()
+
     npass = sum(1 for _, ok in results if ok)
     print("\n%d/%d conformance checks passed" % (npass, len(results)))
     return 0 if npass == len(results) else 1
@@ -189,6 +195,82 @@ def _partial_block():
         oob_ok = all(cout[i] == SENT for i in range(N, CAP))
         check("partial_block%s" % opt, status == "done" and in_ok and oob_ok,
               "status=%s in_range=%s oob_masked=%s" % (status, in_ok, oob_ok))
+
+
+def _run_scalar_gemm(name, src, opt, env=None, a_offset=256, b_offset=512):
+    """Compile/run a 1x1 scalar GEMM and return (status, C[0], disasm)."""
+    A, B, C, K = a_offset, b_offset, 768, 16
+    def wf(path, vals):
+        open(path, "wb").write(b"".join(struct.pack("<f", v) for v in vals))
+    pa, pb, pc = (os.path.join(SCRATCH, name + x) for x in ("_a.bin", "_b.bin", "_c.bin"))
+    # Deliberately keep non-zero tail data after K: the old split-loop bound bug
+    # executed indices 16..18 when the induction variable started at three.
+    wf(pa, [0.25 + 0.03125 * i for i in range(32)])
+    wf(pb, [0.5 - 0.0078125 * i for i in range(32)])
+    wf(pc, [1.25])
+    pm = os.path.join(SCRATCH, name + "_pm.bin")
+    open(pm, "wb").write(struct.pack("<QQQIII", A, B, C, 1, 1, K))
+    aec, err = compile_ptx(name, src, opt, env)
+    if not aec:
+        return "compile-fail: " + (err or "")[:80], None, ""
+    status, data = run_cmodel(
+        aec, (1, 1, 1), (1, 1, 1), 2048,
+        [("pmem", 0, pm), ("gmem", A, pa), ("gmem", B, pb), ("gmem", C, pc)],
+        C, 4)
+    value = struct.unpack("<f", data[:4])[0] if len(data) >= 4 else None
+    return status, value, disasm(aec)
+
+
+def _unroll_regressions():
+    ptx = os.path.join(REPO, "public/C1编译器赛题/testcases/T5_scalar_gemm/kernel.ptx")
+    if not os.path.exists(ptx):
+        check("unroll_regressions", False, "T5 kernel not found"); return
+    base = open(ptx).read()
+
+    # A store to A[1] between the A[0] and A[1] loads makes an early LD.b64
+    # observably wrong.  Since PTX parameters may alias, any write-bearing loop
+    # must retain scalar loads until alias analysis can prove disjointness.
+    memdep = base.replace(
+        "    mov.u32 %r14, 1;",
+        "    mov.u32 %r14, 1;\n    mov.u64 %rd10, 4;\n"
+        "    add.u64 %rd10, %rd1, %rd10;")
+    memdep = memdep.replace(
+        "    ld.global.f32 %f2, [%rd7];",
+        "    ld.global.f32 %f2, [%rd7];\n    st.global.f32 [%rd10], %f1;")
+    s0, v0, _ = _run_scalar_gemm("unroll_memdep_o0", memdep, "-O0")
+    s2, v2, d2 = _run_scalar_gemm("unroll_memdep_o2", memdep, "-O2")
+    ok = s0 == s2 == "done" and v0 == v2 and "LD.gmem.b64" not in d2
+    check("unroll_memdep", ok, "O0=%r O2=%r b64=%s" % (v0, v2, "LD.gmem.b64" in d2))
+
+    # kmain must be relative to the current counter, not to zero:
+    #   start + floor((bound-start)/U)*U.
+    nonzero = base.replace("    mov.u32 %r13, 0;", "    mov.u32 %r13, 3;")
+    s0, v0, _ = _run_scalar_gemm("unroll_start3_o0", nonzero, "-O0")
+    s2, v2, _ = _run_scalar_gemm(
+        "unroll_start3_o2", nonzero, "-O2", {"AEC_NO_MEM_COALESCE": "1"})
+    ok = s0 == s2 == "done" and v0 == v2
+    check("unroll_nonzero_start", ok, "O0=%r O2=%r" % (v0, v2))
+
+    # Same case with a compile-time bound.  `bound % group == 0` is not enough:
+    # divisibility is based on (bound-start), which is 13 here.
+    const_bound = nonzero.replace(
+        "    ld.param.u32 %r3,  [param_K];", "    mov.u32 %r3, 16;")
+    s0, v0, _ = _run_scalar_gemm("unroll_const_start3_o0", const_bound, "-O0")
+    s2, v2, _ = _run_scalar_gemm(
+        "unroll_const_start3_o2", const_bound, "-O2", {"AEC_NO_MEM_COALESCE": "1"})
+    ok = s0 == s2 == "done" and v0 == v2
+    check("unroll_const_nonzero_start", ok, "O0=%r O2=%r" % (v0, v2))
+
+    # Scalar f32 permits 4-byte alignment, while LD.b64 requires eight.  The
+    # optimized image may contain b64, but its entry guard must send this input
+    # (A/B both 4 mod 8) through the original scalar loop.
+    s0, v0, _ = _run_scalar_gemm(
+        "unroll_unaligned_o0", base, "-O0", a_offset=260, b_offset=516)
+    s2, v2, d2 = _run_scalar_gemm(
+        "unroll_unaligned_o2", base, "-O2", a_offset=260, b_offset=516)
+    ok = s0 == s2 == "done" and v0 == v2 and "LD.gmem.b64" in d2
+    check("unroll_b64_alignment_fallback", ok,
+          "O0=%r O2=%r optimized_has_b64=%s" % (v0, v2, "LD.gmem.b64" in d2))
 
 
 if __name__ == "__main__":

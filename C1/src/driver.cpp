@@ -315,7 +315,7 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
   report.numBasicBlocks = (uint32_t)fn.blocks.size();
   report.numVirtualRegisters = fn.regs.nextVReg > 1 ? fn.regs.nextVReg - 1 : 0;
   report.numPhysicalRegisters = fn.regs.maxPhys;
-  report.spillLoads = 0;          // spiller is a stub; no spill code emitted
+  report.spillLoads = 0;
   report.spillStores = 0;
   report.dualIssuePairs = fn.dualIssuePairs;
   report.paramBytes = pbytes;
@@ -333,6 +333,8 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
   uint32_t maxDepth = 0;
   for (unsigned i = 0; i < flat.size(); ++i) {
     const ir::Inst &in = flat[i];
+    if (in.note == "reload") ++report.spillLoads;
+    else if (in.note == "spill") ++report.spillStores;
     if (in.op == isa::Op::BR || in.op == isa::Op::BRX || in.op == isa::Op::JMP)
       ++report.branchCount;
     if (in.op == isa::Op::LD || in.op == isa::Op::LDC) ++report.loadCount;

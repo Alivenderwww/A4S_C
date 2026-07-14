@@ -70,6 +70,23 @@ bool isMemOp(ir::Op op) {
   }
 }
 
+// Pairing two scalar loads changes the second load's time from iteration i+1
+// to iteration i.  That is only semantics-preserving when nothing in the loop
+// can modify memory (PTX pointer parameters carry no no-alias information), and
+// no barrier/atomic can make the earlier access observable.  Read-only loops
+// cover the GEMM reduction we care about; write-bearing loops stay scalar-load
+// exact unless a future alias analysis proves the accessed objects disjoint.
+bool blocksLoadCoalescing(ir::Op op) {
+  switch (op) {
+    case ir::Op::ST: case ir::Op::ATOM: case ir::Op::TSTA: case ir::Op::TMOV:
+    case ir::Op::SSYNC: case ir::Op::SYNC_CT: case ir::Op::SYNC_WG:
+    case ir::Op::MBAR:
+      return true;
+    default:
+      return false;
+  }
+}
+
 } // namespace
 
 bool unrollLoops(ir::Function &fn, const Options &opt) {
@@ -77,6 +94,10 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
   const int maxU = opt.unroll_factor;
   if (maxU < 2) return false;
   bool changed = false;
+
+  // The split-loop legality checks below use predecessor/successor sets.  Do
+  // not trust stale CFG metadata left by an earlier transform.
+  buildCFG(fn);
 
   for (unsigned bi = 0; bi < fn.blocks.size(); ++bi) {
     ir::BasicBlock &b = fn.blocks[bi];
@@ -87,13 +108,16 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     const ir::Inst &brx = b.insts[n - 1];
     const ir::Inst &cmp = b.insts[n - 2];
     const ir::Inst &add = b.insts[n - 3];
-    if (brx.op != ir::Op::BRX) continue;
+    if (brx.op != ir::Op::BRX || brx.guardNeg || b.label.empty() ||
+        brx.target != b.label) continue;
     bool self = false;
     for (unsigned s = 0; s < b.succ.size(); ++s) self |= (b.succ[s] == (int)bi);
     if (!self) continue;
-    if (cmp.op != ir::Op::CMPP || cmp.dst.kind != ir::Operand::Pred ||
-        (cmp.dst.value & 0x7) != (uint32_t)(brx.guard & 0x7)) continue;
-    if (add.op != ir::Op::ADD || add.dst.kind != ir::Operand::Reg ||
+    if (cmp.op != ir::Op::CMPP || cmp.type != ir::Type::U32 ||
+        cmp.modifier != 2u /*lt*/ || cmp.dst.kind != ir::Operand::Pred ||
+        (int)cmp.dst.value != brx.guard) continue;
+    if (add.op != ir::Op::ADD || add.type != ir::Type::U32 ||
+        add.dst.kind != ir::Operand::Reg ||
         cmp.s1.kind != ir::Operand::Reg || cmp.s1.value != add.dst.value) continue;
     if (add.s1.kind != ir::Operand::Reg || add.s1.value != add.dst.value) continue;
 
@@ -178,9 +202,15 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     // bound like GEMM's K param, or a non-multiple constant) the last group has
     // fewer than U valid iterations; the address-IV split path or the predicated
     // in-place path below handles the <U leftover.
-    uint32_t boundConst = 0;
-    const bool divisible = constOf(fn, boundReg, boundConst) && boundConst != 0 &&
-                           (boundConst % (step * (uint32_t)U)) == 0;
+    // All c*step and U*step arithmetic emitted below is u32.  Refuse to unroll
+    // if the group stride itself would wrap.
+    if (step > 0xffffffffu / (uint32_t)U) continue;
+    const uint32_t groupStride = step * (uint32_t)U;
+    uint32_t boundConst = 0, startConst = 0;
+    const bool haveStart = constOf(fn, counter, startConst);
+    const bool divisible = constOf(fn, boundReg, boundConst) && haveStart &&
+                           boundConst > startConst &&
+                           ((boundConst - startConst) % groupStride) == 0;
 
     // ---- Split path: unrolled main loop + scalar remainder ----------------
     // For a strength-reduced address-IV loop with a RUNTIME trip, run
@@ -199,12 +229,48 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     // Requires a power-of-two group stride (kmain via a cheap AND) and a
     // preheader ending in the loop_rotate `BRX Pg -> EXIT` guard (names EXIT).
     if (!addrIV.empty() && !divisible) {
-      const uint32_t grp = step * (uint32_t)U;                 // group stride
+      const uint32_t grp = groupStride;
       const bool pow2 = grp != 0 && (grp & (grp - 1)) == 0;
       const ir::BasicBlock *pre = (bi > 0) ? &fn.blocks[bi - 1] : 0;
-      const bool preOK = pre && !pre->insts.empty() &&
-                         pre->insts.back().op == ir::Op::BRX &&
-                         !pre->insts.back().target.empty();
+      int externalPreds = 0, externalPred = -1;
+      for (unsigned pi = 0; pi < b.pred.size(); ++pi)
+        if (b.pred[pi] != (int)bi) { ++externalPreds; externalPred = b.pred[pi]; }
+      bool preReachesLoop = false;
+      if (pre)
+        for (unsigned si = 0; si < pre->succ.size(); ++si)
+          preReachesLoop |= pre->succ[si] == (int)bi;
+      const ir::Inst *preBr = pre && !pre->insts.empty() ? &pre->insts.back() : 0;
+      const ir::Inst *preCmp = 0;
+      int preCmpAt = -1;
+      if (pre && preBr && preBr->op == ir::Op::BRX)
+        for (int ii = (int)pre->insts.size() - 2; ii >= 0; --ii) {
+          const ir::Inst &x = pre->insts[(unsigned)ii];
+          if (x.op == ir::Op::CMPP && x.dst.kind == ir::Operand::Pred &&
+              (int)x.dst.value == preBr->guard) {
+            preCmp = &x; preCmpAt = ii; break;
+          }
+        }
+      bool guardOperandsStable = preCmpAt >= 0;
+      if (pre && guardOperandsStable)
+        for (int ii = preCmpAt + 1; ii + 1 < (int)pre->insts.size(); ++ii) {
+          const ir::Inst &x = pre->insts[(unsigned)ii];
+          if (x.isTerminator() ||
+              (x.dst.kind == ir::Operand::Reg &&
+               (x.dst.value == counter || x.dst.value == boundReg)) ||
+              (x.dst.kind == ir::Operand::Pred &&
+               (int)x.dst.value == preBr->guard))
+            guardOperandsStable = false;
+        }
+      const bool preOK = pre && externalPreds == 1 && externalPred == (int)bi - 1 &&
+                         preReachesLoop && !pre->insts.empty() &&
+                         preCmp && preCmp->op == ir::Op::CMPP &&
+                         preCmp->dst.kind == ir::Operand::Pred &&
+                         preCmp->s1.kind == ir::Operand::Reg && preCmp->s1.value == counter &&
+                         preCmp->s2.kind == ir::Operand::Reg && preCmp->s2.value == boundReg &&
+                         preCmp->modifier == 5u /*ge*/ && preBr && preBr->op == ir::Op::BRX &&
+                         preBr->guard == (int)preCmp->dst.value && !preBr->guardNeg &&
+                         guardOperandsStable && !preBr->target.empty() &&
+                         preBr->target != b.label;
       if (pow2 && preOK) {
         const std::string exitLabel = pre->insts.back().target;
         const std::string loopLabel = b.label;
@@ -230,7 +296,33 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
           uint32_t sv = 0;
           if (constOf(fn, addrStride[a], sv) && sv == 4) unitStrideIV.insert(addrIV[a]);
         }
-        const bool coalesceLoads = std::getenv("AEC_NO_MEM_COALESCE") == 0;
+        bool readOnlyLoop = true;
+        for (int i = 0; i < n - 3; ++i)
+          if (blocksLoadCoalescing(body[i].op)) { readOnlyLoop = false; break; }
+        const bool coalesceLoads = readOnlyLoop &&
+                                   std::getenv("AEC_NO_MEM_COALESCE") == 0;
+        std::set<uint32_t> coalescedIV;
+        if (coalesceLoads) {
+          // The guard on a paired load must have the same truth value in both
+          // iterations.  A predicate defined in the loop is not invariant.
+          std::set<uint32_t> loopPredDefs;
+          std::map<uint32_t, unsigned> bodyDefCount;
+          for (int i = 0; i < n - 3; ++i)
+            if (body[i].dst.kind == ir::Operand::Pred) {
+              loopPredDefs.insert(body[i].dst.value & 7u);
+            } else if (body[i].dst.kind == ir::Operand::Reg) {
+              ++bodyDefCount[body[i].dst.value];
+            }
+          for (int i = 0; i < n - 3; ++i) {
+            const ir::Inst &in = body[i];
+            if (in.op == ir::Op::LD && in.type == ir::Type::F32 &&
+                in.modifier == (uint32_t)isa::Space::GMEM &&
+                in.dst.kind == ir::Operand::Reg && bodyDefCount[in.dst.value] == 1 &&
+                in.s1.kind == ir::Operand::Reg && unitStrideIV.count(in.s1.value) &&
+                (in.guard < 0 || !loopPredDefs.count((uint32_t)in.guard & 7u)))
+              coalescedIV.insert(in.s1.value);
+          }
+        }
         std::map<uint32_t, uint32_t> pendingLo;   // body load-dst -> even copy's lo vreg
 
         // MAIN body: U copies, shared IVs advanced between copies, no predicate.
@@ -266,9 +358,10 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
             const bool pairableLoad =
                 coalesceLoads && c + (c & 1 ? 0 : 1) < U &&
                 in.op == ir::Op::LD && in.type == ir::Type::F32 &&
+                in.modifier == (uint32_t)isa::Space::GMEM &&
                 in.dst.kind == ir::Operand::Reg &&
                 in.s1.kind == ir::Operand::Reg &&
-                unitStrideIV.count(in.s1.value);
+                coalescedIV.count(in.s1.value);
             renameOperand(in.dst, ren); renameOperand(in.s1, ren);
             renameOperand(in.s2, ren); renameOperand(in.s3, ren);
 
@@ -294,8 +387,15 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
             mainI.push_back(adv);
           }
         }
-        uint32_t maskReg = fn.regs.nextVReg++, kmainReg = fn.regs.nextVReg++, ustepReg = fn.regs.nextVReg++;
+        uint32_t maskReg = fn.regs.nextVReg++, remainingReg = fn.regs.nextVReg++;
+        uint32_t kmainReg = fn.regs.nextVReg++, ustepReg = fn.regs.nextVReg++;
+        uint32_t alignMaskReg = 0, alignTmpReg = 0;
+        if (!coalescedIV.empty()) {
+          alignMaskReg = fn.regs.nextVReg++;
+          alignTmpReg = fn.regs.nextVReg++;
+        }
         uint32_t pMain = fn.regs.nextPred++, pEntry = fn.regs.nextPred++, pRem = fn.regs.nextPred++;
+        uint32_t pAlign = coalescedIV.empty() ? 0 : fn.regs.nextPred++;
         { ir::Inst li; li.op = ir::Op::LOADI; li.type = ir::Type::U32;
           li.dst = ir::Operand::reg(ustepReg); li.hasImm = true; li.imm = grp; mainI.push_back(li); }
         { ir::Inst ad = addI; ad.s2 = ir::Operand::reg(ustepReg); mainI.push_back(ad); }  // counter += U*step
@@ -304,16 +404,43 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
         { ir::Inst bx = brxI; bx.guard = (int)pMain; bx.guardNeg = false; bx.target = mainLabel;
           mainI.push_back(bx); }                                                          // BRX Pm -> main
 
-        // main-guard: kmain = bound & ~(grp-1) ; BRX (counter>=kmain) -> remainder
+        // main-guard:
+        //   kmain = counter + ((bound-counter) & ~(grp-1))
+        // This handles a non-zero initial counter.  The loop-rotate preheader
+        // has already established counter < bound, so unsigned subtraction is
+        // well-defined here.  If any b64 source is not 8-byte aligned, branch
+        // to the original scalar loop before executing the unrolled main loop.
         std::vector<ir::Inst> guardI;
         { ir::Inst li; li.op = ir::Op::LOADI; li.type = ir::Type::U32;
           li.dst = ir::Operand::reg(maskReg); li.hasImm = true; li.imm = ~(grp - 1); guardI.push_back(li); }
+        { ir::Inst su; su.op = ir::Op::SUB; su.type = ir::Type::U32;
+          su.dst = ir::Operand::reg(remainingReg); su.s1 = ir::Operand::reg(boundReg);
+          su.s2 = ir::Operand::reg(counter); guardI.push_back(su); }
         { ir::Inst an; an.op = ir::Op::AND; an.type = ir::Type::U32;
-          an.dst = ir::Operand::reg(kmainReg); an.s1 = ir::Operand::reg(boundReg);
+          an.dst = ir::Operand::reg(remainingReg); an.s1 = ir::Operand::reg(remainingReg);
           an.s2 = ir::Operand::reg(maskReg); guardI.push_back(an); }
+        { ir::Inst ad; ad.op = ir::Op::ADD; ad.type = ir::Type::U32;
+          ad.dst = ir::Operand::reg(kmainReg); ad.s1 = ir::Operand::reg(counter);
+          ad.s2 = ir::Operand::reg(remainingReg); guardI.push_back(ad); }
         { ir::Inst c2 = cmpI; c2.dst = ir::Operand::pred(pEntry); c2.modifier = 5u /*ge*/;
           c2.s1 = ir::Operand::reg(counter); c2.s2 = ir::Operand::reg(kmainReg); guardI.push_back(c2); }
         { ir::Inst bx = brxI; bx.guard = (int)pEntry; bx.guardNeg = false; bx.target = loopLabel; guardI.push_back(bx); }
+        if (!coalescedIV.empty()) {
+          { ir::Inst li; li.op = ir::Op::LOADI; li.type = ir::Type::U32;
+            li.dst = ir::Operand::reg(alignMaskReg); li.hasImm = true; li.imm = 7u;
+            guardI.push_back(li); }
+          for (std::set<uint32_t>::const_iterator it = coalescedIV.begin();
+               it != coalescedIV.end(); ++it) {
+            { ir::Inst an; an.op = ir::Op::AND; an.type = ir::Type::U32;
+              an.dst = ir::Operand::reg(alignTmpReg); an.s1 = ir::Operand::reg(*it);
+              an.s2 = ir::Operand::reg(alignMaskReg); guardI.push_back(an); }
+            { ir::Inst c2 = cmpI; c2.dst = ir::Operand::pred(pAlign);
+              c2.modifier = 1u /*ne*/; c2.s1 = ir::Operand::reg(alignTmpReg);
+              c2.s2 = ir::Operand::phys(0); guardI.push_back(c2); }
+            { ir::Inst bx = brxI; bx.guard = (int)pAlign; bx.guardNeg = false;
+              bx.target = loopLabel; guardI.push_back(bx); }
+          }
+        }
 
         // rem-guard: BRX (counter>=bound) -> EXIT  (skips a zero-length remainder)
         std::vector<ir::Inst> remGuardI;

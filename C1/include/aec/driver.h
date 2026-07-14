@@ -35,8 +35,8 @@ struct CompileReport {
   uint32_t numVirtualRegisters  = 0;
   uint32_t numPhysicalRegisters = 0;
   uint32_t numPredicates        = 0;
-  uint32_t spillLoads           = 0;  // spiller is a stub -> 0 on current kernels
-  uint32_t spillStores          = 0;
+  uint32_t spillLoads           = 0;  // emitted LMEM reload instructions
+  uint32_t spillStores          = 0;  // emitted LMEM spill instructions
   uint32_t branchCount          = 0;
   uint32_t loadCount            = 0;
   uint32_t storeCount           = 0;
