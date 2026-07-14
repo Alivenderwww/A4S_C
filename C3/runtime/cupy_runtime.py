@@ -310,7 +310,11 @@ class CupyRuntime:
             self._copy_stream = cp.cuda.Stream(non_blocking=True)
         cs = self._copy_stream
         main = cp.cuda.get_current_stream()
-        D = 8                                     # nodes of prefetch look-ahead
+        # Prefetch look-ahead (nodes). A sweep found D=2 optimal: enough to hide
+        # the next weight's H2D behind the current matmul, while holding fewer
+        # weights in flight than a deep look-ahead -> both faster AND lower peak
+        # (D=2: 7.38s/5.53GB vs D=8: 7.45s/5.80GB, D=16: 7.64s/6.00GB).
+        D = 2
         up_evt: Dict[int, Any] = {}
         last_cmp = [None]
 
