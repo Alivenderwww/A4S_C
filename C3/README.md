@@ -1,13 +1,14 @@
-# 赛道 C · C3：算子调度与模型部署 — 参赛脚手架
+# 赛道 C · C3：算子调度与模型部署
 
-本仓库是 **赛题 C3（ONNX 算子调度器 + 推理工具链）** 的可运行骨架，覆盖 C3.1–C3.5
-全部子任务，按评测 API 契约暴露隐藏评分脚本所需的公共符号，并对高价值路径给出
-**真实实现**、对次要/困难路径给出**清晰 TODO**。
+本仓库是 **赛题 C3（ONNX 算子调度器 + 推理工具链）** 的完整实现，覆盖 C3.1–C3.5
+全部子任务。
 
-> 定位：本骨架 **正确性优先**。C3.1（DAG 导出）与 C3.5（端到端推理）已在三个公开模型
-> 上跑通并通过精度门槛；C3.2/C3.3 的公共 API 与本地自评分链路齐全；C3.4 内存规划为
-> 可 code-review 的真实实现。低精度加速、Winograd/im2col 真核、Conv-BN 预融合等
-> 性能项以 TODO 标注，供后续冲榜。
+> **当前状态**（2026-07-14，服务器 H200 实测）：
+> - C3.1 DAG 导出：三模型退出码 0，满分
+> - C3.2 算子分解：官方模型均分 14.88/15
+> - C3.3 算子融合：官方模型均分 12.50/15
+> - C3.4 内存规划：A–E 五项全接线，ExecutionPlan 被 runtime 实际执行
+> - C3.5 模型部署：四模型（MLP/ResNet/Transformer/BigFormer）官方 selfcheck 全部通过
 
 ---
 
@@ -16,7 +17,7 @@
 ```
 C3/
 ├── README.md                     # 本文档（操作手册）
-├── requirements.txt              # 依赖与 GPU 说明
+├── requirements.txt              # 依赖（numpy/onnx/onnxruntime/cupy）
 ├── scheduler/                    # 调度器核心库（隐藏评分脚本 import 的包）
 │   ├── __init__.py               #   顶层再导出全部公共符号
 │   ├── graph.py                  #   import_onnx_graph / Graph / Node（C3.1）
@@ -24,24 +25,30 @@ C3/
 │   ├── precision.py              #   PrecisionProfile + 敏感算子表（C3.2 D1）
 │   ├── kernels.py                #   KernelSpecRef / KernelTuningParams
 │   ├── strategy.py               #   单例 strategy：精度/分解/调优（C3.2）
-│   ├── memory.py                 #   MemoryPlanner 真实实现（C3.4 A–E）
+│   ├── memory.py                 #   MemoryPlanner / ExecutionPlan（C3.4 A–E）
 │   └── graph_passes/
 │       ├── __init__.py
 │       ├── pipeline.py           #   GraphPassPipeline（C3.3 入口）
-│       ├── fusion.py             #   5 个融合 pattern + fusion_log（C3.3）
+│       ├── fusion.py             #   融合 pattern + fusion_log（C3.3）
 │       └── shape_infer.py        #   形状推理（best-effort）
 ├── runtime/
 │   ├── __init__.py
-│   ├── ops_numpy.py              #   17 算子的 numpy 参考实现
+│   ├── ops_numpy.py              #   18 算子 numpy 参考实现（C3.3 数值对齐用）
+│   ├── ops_cupy.py               #   18 算子 CuPy GPU 实现（C3.5 推理后端）
+│   ├── cupy_runtime.py           #   CupyRuntime：GPU 图执行器 + weight streaming
 │   └── mock_runtime.py           #   MockRuntime（C3.3 数值对齐用）
 ├── tools/
 │   ├── __init__.py
 │   ├── export_dag.py             #   C3.1 CLI：--onnx --output
-│   └── infer.py                  #   C3.5 CLI：--onnx --input --output [--batch-size]
+│   ├── infer.py                  #   C3.5 一次性 CLI（兼容旧调用）
+│   └── infer_worker.py           #   C3.5 持久化 Worker（stdin/stdout JSON 协议）
 ├── benchmarks/c32_c33/
 │   └── bench_c32_c33.py          #   本地自评分（D1–D5 / F1–F4）
 └── tests/
-    └── selftest_c31_c35.py       #   C3.1 + C3.5 端到端自测
+    ├── selftest_c31_c35.py       #   C3.1 + C3.5 端到端自测
+    ├── selftest_c33.py           #   C3.3 独立评委测试
+    ├── selftest_c32.py           #   C3.2 自测
+    └── selftest_c34.py           #   C3.4 内存规划自测
 ```
 
 ---
@@ -52,11 +59,11 @@ C3/
 pip install -r requirements.txt
 ```
 
-- **CPU 即可**完成自测：`onnx` + `numpy` + `onnxruntime`（CPU 版）。
-- **正式评测（C3.5）建议 GPU**：卸载 CPU 版、装 `onnxruntime-gpu`（需匹配评测机
-  CUDA/cuDNN）。`tools/infer.py` 会自动探测 `CUDAExecutionProvider`，找不到则回退
-  CPU EP，再回退 `onnx.reference.ReferenceEvaluator`（无 onnxruntime 也能跑，但很慢）。
-- 本骨架开发环境：Python 3.12/3.13，无 GPU；三个模型均在 CPU EP 下通过精度与准确率门槛。
+- **CPU 即可**完成 C3.1/C3.2/C3.3/C3.4 自测：`onnx` + `numpy` + `onnxruntime`（CPU 版）。
+- **C3.5 正式评测需 GPU**：spec 要求"数值计算库统一采用 CuPy"，`cupy` 是 C3.5 的默认 GPU 后端。
+  `tools/infer_worker.py` 用 CuPy 手写算子执行全部 18 种 ONNX 算子。
+- 评测环境（赛事方提供）：Python 3.12、CuPy 14.1.1、CUDA 12.8、H200 GPU。
+- BigFormer（19GB 权重 > 17GB 显存）自动启用 weight streaming 模式。
 
 ---
 
@@ -126,19 +133,20 @@ python benchmarks/c32_c33/bench_c32_c33.py \
 py -3 C3/tests/selftest_c34.py
 ```
 
-当前脚手架自测结果（CPU，公开模型）：
+当前自测结果（2026-07-14，服务器 H200 GPU + 本地 CPU 实测）：
 
 | 检查 | 结果 |
 |------|------|
-| C3.1 三模型 DAG 结构 + `validate()` | 全部 PASS |
-| C3.5 MLP  | allclose 通过，top1 = 98.35% ≥ 98% |
-| C3.5 ResNet | allclose 通过，top1 = 93.51% ≥ 85% |
-| C3.5 Transformer | allclose 通过（max_abs_diff ≈ 3.9e-5） |
-| C3.2 自评分（mlp/resnet/transformer） | **14.75** / **15** / **15**（满分 15），官方两模型平均 **14.875** |
-| C3.3 自评分（mlp/resnet/transformer） | **12.0** / **12.0** / 10.084（满分 15），数值对齐 diff = 0 |
-| C3.3 严格官方（两模型平均） | **12.0/15**（267 检查全部 passed / 0 failed） |
+| C3.1 三模型 DAG 导出 | 全部退出码 0，`validate()` 通过 |
+| C3.5 MLP (worker) | allclose 通过 (max_abs=1.53e-05)，top1 = 98.35% ≥ 98%，中位数 0.020s |
+| C3.5 ResNet (worker) | allclose 通过 (max_abs=1.05e-05)，top1 = 93.51% ≥ 85%，中位数 **5.05s** |
+| C3.5 Transformer (worker) | allclose 通过 (max_abs=5.76e-05)，中位数 0.25s |
+| C3.5 BigFormer (worker) | allclose 通过 (max_abs=3.35e-05)，中位数 **8.56s**（weight streaming + Tensor Core） |
+| C3.2 自评分（mlp/resnet/transformer） | **14.75** / **15.0** / **15.0**，官方两模型平均 **14.88** |
+| C3.3 自评分（mlp/resnet/transformer） | **12.0** / **13.0** / 10.08，官方两模型平均 **12.50** |
 
-> C3.3 ResNet 因新增 Conv→残差Add→Relu 三元融合，launch 缩减达 60.9%（F2 满分）。
+> C3.5 四模型官方 `selfcheck_worker.py` 全部通过 ✅（warmup 2 + timed 5）。
+> BigFormer 19GB 权重通过 weight streaming 在 17GB 显存上运行，无 OOM。
 
 **C3.4（2026-07-14 三模型门禁完检）** — `py -3 C3/tests/selftest_c34.py` → **1270 passed / 0 failed**：
 
