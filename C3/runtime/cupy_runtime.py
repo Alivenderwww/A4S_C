@@ -80,22 +80,33 @@ class CupyRuntime:
                     self._init_gpu[name] = arr
                 else:
                     self._init_gpu[name] = cp.asarray(arr)
-        # Streaming: precompute each float weight's last-use step so we can free
-        # it immediately after its consuming node, keeping peak memory low.
-        if streaming:
-            self._weight_last_use = self._compute_last_use()
-        # Last consumer (topo index) of every intermediate activation. run()
-        # drops each activation right after its final use instead of holding all
-        # ~1000 node outputs for the whole forward pass. That O(nodes x batch)
-        # activation footprint -- not the weights -- is what OOMs at large batch
-        # (bs=32 already exceeds 16 GB); freeing dead activations caps peak at
-        # the live set, so the full sample set fits in one pass and streamed
-        # weights are uploaded ONCE, not once per micro-batch.
-        self._act_last_use: Dict[str, int] = {}
-        for i, node in enumerate(self._topo):
-            for t in node.inputs:
-                if t and t not in self._init_host:
-                    self._act_last_use[t] = i
+        # Build the C3.4 memory plan on the graph we actually execute (post
+        # GELU-fusion) and drive execution from ITS schedule, so a single
+        # memory-planning strategy (scheduler.memory) feeds both the C3.4 review
+        # artifact (plan.steps / summary) and this C3.5 executor. The plan's
+        # per-node ``uploads_before`` / ``frees_after`` reproduce the previous
+        # hand-rolled streaming + activation-lifetime freeing exactly (identical
+        # last-use analysis), so peak memory, timing and precision are unchanged:
+        #   * frees_after[i]  : dead intermediates (activation-lifetime reuse) and,
+        #                       in streaming mode, weights past their last use.
+        #   * uploads_before[i]: streamed float weights this node first consumes.
+        # The O(nodes x batch) activation footprint -- not the weights -- is what
+        # OOMs at large batch (bs=32 already exceeds 16 GB); freeing dead
+        # activations caps peak at the live set so the full set fits in one pass.
+        from scheduler.memory import build_execution_plan
+        exec_graph = Graph(name=self.graph.name, nodes=self._topo,
+                           inputs=self.graph.inputs, outputs=self.graph.outputs,
+                           initializers=self.graph.initializers)
+        self._plan = build_execution_plan(exec_graph, streaming=streaming)
+        # Remap the plan's index-keyed schedule onto our own topo order by node
+        # name (robust even if the plan's topo sort tie-breaks differently).
+        topo_idx = {n.name: i for i, n in enumerate(self._topo)}
+        self._uploads_before: Dict[int, List[str]] = {}
+        self._frees_after: Dict[int, List[str]] = {}
+        for i, name in enumerate(self._plan.order_names):
+            j = topo_idx[name]
+            self._uploads_before[j] = self._plan.uploads_before.get(i, [])
+            self._frees_after[j] = self._plan.frees_after.get(i, [])
         self._output_names = {t.name for t in graph.outputs}
 
     def _fuse_gelu(self):
@@ -117,7 +128,7 @@ class CupyRuntime:
 
         fused: Dict[int, Node] = {}
         drop = set()
-        for erf in self._topo:
+        for k, erf in enumerate(self._topo):
             if erf.op_type != "Erf":
                 continue
             d = prod.get(erf.inputs[0])
@@ -133,7 +144,10 @@ class CupyRuntime:
             m2 = only(m1.outputs[0])
             if m2 is None or m2.op_type != "Mul":
                 continue
-            fused[id(erf)] = Node(name="FusedGelu_" + (erf.name or ""),
+            # Unique name (index-suffixed): the memory plan keys its per-node
+            # schedule by topo position, resolved via node name, so a collision
+            # (e.g. two Erf nodes with empty names) would misalign the schedule.
+            fused[id(erf)] = Node(name=f"FusedGelu_{k}_" + (erf.name or ""),
                                   op_type="FusedGelu", inputs=[h],
                                   outputs=[m2.outputs[0]])
             drop.update(id(n) for n in (d, erf, a, m1, m2))
@@ -142,32 +156,6 @@ class CupyRuntime:
         self._topo = [fused[id(n)] if id(n) in fused else n
                       for n in self._topo if id(n) in fused or id(n) not in drop]
 
-    def _compute_last_use(self) -> Dict[str, int]:
-        """tensor name -> index in topo order of its last consuming node.
-
-        Also tracks tensor *aliases* produced by Identity nodes (BigFormer
-        wires weights through Identity, e.g. ``blocks.0.ln1.bias -> ln_f.bias``):
-        the alias must live as long as its last consumer too.
-        """
-        last: Dict[str, int] = {}
-        # map alias -> source initializer (built from Identity nodes)
-        alias_source: Dict[str, str] = {}
-        for node in self._topo:
-            if node.op_type == "Identity" and len(node.inputs) == 1:
-                src = node.inputs[0]
-                if src in self._init_host:
-                    for o in node.outputs:
-                        alias_source[o] = src
-        for i, node in enumerate(self._topo):
-            for t in node.inputs:
-                # track both original initializers and their Identity aliases
-                src = alias_source.get(t, t)
-                if src in self._init_host and self._init_host[src].dtype.kind == "f":
-                    last[src] = i
-                elif t in self._init_host and self._init_host[t].dtype.kind == "f":
-                    last[t] = i
-        return last
-
     @property
     def input_dtypes(self) -> Dict[str, Any]:
         return {t.name: t.dtype for t in self.graph.inputs}
@@ -175,29 +163,43 @@ class CupyRuntime:
     def run(self, feeds: Dict[str, Any]) -> Dict[str, np.ndarray]:
         env: Dict[str, Any] = {}
         if not self.streaming:
-            # eager: all weights already on device / host metadata
+            # eager: every weight already resident on device / host metadata
             for name, val in self._init_gpu.items():
                 env[name] = val
+        else:
+            # streaming: float weights arrive per-node via the plan; only the
+            # small int metadata (Reshape shapes / Split sizes) stays resident.
+            for name, arr in self._init_host.items():
+                if arr.dtype.kind != "f":
+                    env[name] = arr
         # seed external inputs (upload this batch)
         for name, val in feeds.items():
-            arr = np.asarray(val)
-            env[name] = cp.asarray(arr)
+            env[name] = cp.asarray(np.asarray(val))
 
+        uploads, frees = self._uploads_before, self._frees_after
         for i, node in enumerate(self._topo):
+            # A/D: bring in the float weights this node is the first to consume.
             if self.streaming:
-                self._stream_weights_for(node, env, i)
+                for w in uploads.get(i, ()):
+                    self._upload_weight(w, env)
             self._exec_node(node, env)
-            if self.streaming:
-                self._free_weights_after(node, env, i)
-            # Drop intermediate activations whose last consumer was this node so
-            # the CuPy pool can reuse the block for the next one. Weights (in
-            # _init_host, freed by _free_weights_after) and graph outputs are
-            # left alone. This bounds peak to the live activation set.
-            for t in node.inputs:
-                if self._act_last_use.get(t) == i and t not in self._output_names:
-                    v = env.get(t)
-                    if v is not None and hasattr(v, "ndim") and not isinstance(v, np.ndarray):
-                        del env[t]
+            # B/C: release everything the plan says dies at this step -- dead
+            # intermediates (activation-lifetime reuse) and, in streaming mode,
+            # weights past their last use. Freeing a weight then forces the pool
+            # to return the block to the allocator: a bare del only drops the
+            # Python ref while the pool keeps the block cached, so streamed
+            # weights would otherwise accumulate across layers and OOM.
+            freed_weight = False
+            for t in frees.get(i, ()):
+                v = env.pop(t, None)
+                if (v is not None and not isinstance(v, np.ndarray)
+                        and hasattr(v, "ndim") and t in self._init_host):
+                    freed_weight = True
+            if freed_weight:
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
 
         out: Dict[str, np.ndarray] = {}
         for t in self.graph.outputs:
@@ -207,63 +209,18 @@ class CupyRuntime:
             out[t.name] = cp.asnumpy(v) if hasattr(v, "ndim") and not isinstance(v, np.ndarray) else np.asarray(v)
         return out
 
-    def _stream_weights_for(self, node: Node, env: Dict[str, Any], step: int) -> None:
-        """Upload float weights this node needs, on demand (called BEFORE exec).
-
-        Handles Identity-produced aliases (BigFormer wires weights through
-        Identity): when a node consumes an alias, upload the source initializer
-        and bind it under the alias name. int64/int32 metadata stays on host.
-        Freeing happens in :meth:`_free_weights_after` (called AFTER exec) so a
-        weight used and freed on the same step is still live during execution.
-        """
-        if not hasattr(self, "_alias_source"):
-            self._alias_source = {}
-            for n in self._topo:
-                if n.op_type == "Identity" and len(n.inputs) == 1 and n.inputs[0] in self._init_host:
-                    for o in n.outputs:
-                        self._alias_source[o] = n.inputs[0]
-
-        for t in node.inputs:
-            if t == "" or t in env:
-                continue
-            src = self._alias_source.get(t, t)
-            host = self._init_host.get(src if src in self._init_host else t)
-            if host is None:
-                continue
-            if src in env and src != t:
-                env[t] = env[src]
-                continue
-            if host.dtype.kind == "f":
-                env[t] = cp.asarray(host)
-            else:
-                env[t] = host  # int metadata stays host-side
-
-    def _free_weights_after(self, node: Node, env: Dict[str, Any], step: int) -> None:
-        """Release float weights whose last use was this step (called AFTER exec).
-
-        Dropping the ``env`` reference lets CuPy's memory pool reclaim the GPU
-        block, keeping peak weight memory at ~one layer instead of the full model.
-        """
-        if not hasattr(self, "_alias_source"):
+    def _upload_weight(self, name: str, env: Dict[str, Any]) -> None:
+        """Upload one streamed float weight to the device before its first
+        consumer (per ``plan.uploads_before``). Names already present -- int
+        metadata seeded up front, or a value a Constant node produced -- are left
+        as-is; a weight wired through Identity is uploaded under its source name
+        here and aliased downstream when op_Identity runs."""
+        if name in env:
             return
-        freed_any = False
-        for t in node.inputs:
-            src = self._alias_source.get(t, t)
-            if self._weight_last_use.get(src) == step:
-                for key in (t, src):
-                    v = env.get(key)
-                    if v is not None and hasattr(v, "ndim") and not isinstance(v, np.ndarray):
-                        del env[key]
-                        freed_any = True
-        # Force the CuPy memory pool to actually return freed blocks to the
-        # allocator — without this ``del`` only drops the Python reference and
-        # the pool keeps the GPU block cached, so BigFormer's 19 GB of streamed
-        # weights accumulate across layers and OOM.
-        if freed_any:
-            try:
-                cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
+        host = self._init_host.get(name)
+        if host is None:
+            return
+        env[name] = cp.asarray(host) if host.dtype.kind == "f" else host
 
     # ------------------------------------------------------------------
     def _exec_node(self, node: Node, env: Dict[str, Any]) -> None:

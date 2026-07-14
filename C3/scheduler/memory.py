@@ -348,6 +348,17 @@ class PlanStep:
 class ExecutionPlan:
     steps: List[PlanStep] = field(default_factory=list)
     summary: Dict[str, Any] = field(default_factory=dict)
+    # Per-node execution schedule the C3.5 runtime consumes directly (keyed by
+    # index into the plan's node order). ``uploads_before[i]`` = float weights to
+    # H2D right before node i runs; ``frees_after[i]`` = tensors (dead
+    # intermediates and, in streaming mode, spent weights) to release right after
+    # node i. This is how one memory-planning strategy drives both the C3.4
+    # review artifact (steps/summary) and the C3.5 executor (this schedule).
+    uploads_before: Dict[int, List[str]] = field(default_factory=dict)
+    frees_after: Dict[int, List[str]] = field(default_factory=dict)
+    # Node names in the plan's execution order (so a consumer can map the
+    # index-keyed schedule above onto its own node list by name, robustly).
+    order_names: List[str] = field(default_factory=list)
 
     def kinds(self) -> Dict[str, int]:
         out: Dict[str, int] = {}
@@ -650,11 +661,89 @@ def _default_tensor_bytes(graph: Graph, batch: int = 1):
     return size_of
 
 
+def _identity_alias_map(order: List[Node], init_names) -> Dict[str, str]:
+    """Map Identity-produced aliases back to their source initializer.
+
+    BigFormer wires one weight to several use points through ``Identity`` nodes
+    (``blocks.0.ln1.bias -> ln_f.bias``), so the streamed weight must live as
+    long as its *last* aliased use, not just its direct one.
+    """
+    alias_source: Dict[str, str] = {}
+    for node in order:
+        if node.op_type == "Identity" and len(node.inputs) == 1 and node.inputs[0] in init_names:
+            for o in node.outputs:
+                if o:
+                    alias_source[o] = node.inputs[0]
+    return alias_source
+
+
+def _stream_weight_lifetimes(order: List[Node], graph: Graph):
+    """First/last consuming-step of every *float* weight, Identity-alias aware.
+
+    ``first`` drives the just-in-time H2D upload (upload right before the first
+    node that reads the weight or one of its aliases); ``last`` drives the free
+    (release right after the last such node). Mirrors the runtime's original
+    ``_compute_last_use`` exactly so the plan-driven schedule reproduces the
+    proven streaming behaviour byte-for-byte.
+    """
+    init_names = graph.initializer_names
+    inits = graph.initializers
+    # Constant nodes emit an initializer as their *output*: it is produced at run
+    # time by op_Constant, not host-streamed, so it is not a streamed weight.
+    node_outputs = {o for node in order for o in node.outputs if o}
+    alias_source = _identity_alias_map(order, init_names)
+    first: Dict[str, int] = {}
+    last: Dict[str, int] = {}
+    for i, node in enumerate(order):
+        for t in node.inputs:
+            if not t:
+                continue
+            src = alias_source.get(t, t)
+            if src in init_names and src not in node_outputs:
+                v = inits.get(src)
+                if v is not None and getattr(v, "dtype", None) is not None and v.dtype.kind == "f":
+                    first.setdefault(src, i)
+                    last[src] = i
+    return first, last
+
+
+def _runtime_schedule(order, graph, life, streaming):
+    """Per-node (uploads_before, frees_after) the C3.5 runtime executes.
+
+    * ``frees_after[i]`` releases every intermediate whose last consumer is
+      node i (lifetime reuse, C3.4-B) — graph outputs and weights excluded.
+    * In streaming mode it additionally uploads each float weight before its
+      first consumer and frees it after its last (C3.4-A/D), so peak weight
+      memory stays at ~one layer. Eager mode preloads all weights, so
+      ``uploads_before`` stays empty and only intermediates are freed.
+    """
+    n = len(order)
+    init_names = graph.initializer_names
+    output_names = graph.output_names()
+    uploads_before: Dict[int, List[str]] = {i: [] for i in range(n)}
+    frees_after: Dict[int, List[str]] = {i: [] for i in range(n)}
+
+    # B: dead-intermediate frees (weights and graph outputs are handled apart)
+    for t, lt in life.lifetimes.items():
+        if lt.last < n and t not in output_names and t not in init_names:
+            frees_after[lt.last].append(t)
+
+    # A/D: streamed weight upload + free schedule
+    if streaming:
+        first, last = _stream_weight_lifetimes(order, graph)
+        for w, i in first.items():
+            uploads_before[i].append(w)
+        for w, i in last.items():
+            frees_after[i].append(w)
+    return uploads_before, frees_after
+
+
 def build_execution_plan(
     graph: Graph,
     num_streams: int = 2,
     prefetch_distance: int = 2,
     batch: int = 1,
+    streaming: bool = False,
 ) -> ExecutionPlan:
     """Assemble the full A–E execution plan for a graph.
 
@@ -716,6 +805,21 @@ def build_execution_plan(
     for node in order:
         node_weights[node.name] = [t for t in node.inputs if t in init_names]
 
+    # Constant-produced initializers are emitted by their Constant node at run
+    # time, not host-streamed -- exclude them from the streamed-weight free
+    # schedule (they are uploaded once, eagerly, below and stay resident).
+    node_output_names = {o for node in order for o in node.outputs if o}
+
+    # Streaming (BigFormer): last step that directly consumes each weight, so it
+    # can be freed right after (peak weight footprint ~ one layer, not the whole
+    # model). Eager mode keeps every weight resident and skips this.
+    weight_last_direct_use: Dict[str, int] = {}
+    if streaming:
+        for i, node in enumerate(order):
+            for w in node_weights[node.name]:
+                if w not in node_output_names:
+                    weight_last_direct_use[w] = i
+
     # slot -> live Allocation (physical buffer backing that slot)
     slot_alloc: Dict[int, Allocation] = {}
     # slot -> the tensor currently occupying its physical buffer (for freeing)
@@ -724,6 +828,7 @@ def build_execution_plan(
     weight_uploaded: set = set()
     # Persistent allocation metadata for binding & validator cross-ref
     weight_alloc_map: Dict[str, Tuple[int, int]] = {}    # name -> (offset, size)
+    weight_alloc_obj: Dict[str, Allocation] = {}          # name -> live Allocation (streaming free)
     tensor_alloc_info: Dict[str, Dict[str, int]] = {}    # name -> {slot, offset, size}
 
     # Pre-build death_events from last_use so we never scan node.inputs at
@@ -748,24 +853,43 @@ def build_execution_plan(
                                    tensor=name, device_offset=alloc.offset, size=nb,
                                     detail="H2D enqueue (copy stream)"))
         weight_alloc_map[name] = (alloc.offset, nb)
+        weight_alloc_obj[name] = alloc
         weight_uploaded.add(name)
 
-    for i, node in enumerate(order):
-        # ---- D: prefetch weights of the layer `prefetch_distance` ahead ----
-        # This runs *after* the previous compute step (which emitted at the end
-        # of the last loop iteration), so the copy-stream H2D genuinely
-        # overlaps with compute rather than bulk-uploading before the 1st kernel.
-        ahead = i + prefetch_distance
-        if ahead < n:
-            for w in node_weights[order[ahead].name]:
-                upload_weight(w)
+    # Streaming: upload Constant-produced initializers once, up front, so their
+    # device buffer is allocated before the Constant node's compute (preserving
+    # the plan's alloc-before-use invariant that the validator checks) and they
+    # stay resident -- they are tiny (scales / shapes) and not worth re-streaming.
+    if streaming:
+        for name in init_names:
+            if name in node_output_names:
+                upload_weight(name)
 
-        # ---- A/D: this layer's own weights, just-in-time before its compute ----
-        # Only upload here if prefetch did not already cover them (small models
-        # with prefetch_distance >= 1 will have these covered; this is the
-        # safety net so every compute step sees its weights on device).
-        for w in node_weights[node.name]:
-            upload_weight(w)
+    for i, node in enumerate(order):
+        if streaming:
+            # ---- A/D (streaming): upload this node's own weights just-in-time,
+            # right before its compute. No look-ahead prefetch: the whole model's
+            # weights do not fit, so each is brought in only when consumed and
+            # freed immediately after (see the weight-free block below), capping
+            # peak weight memory at ~one layer.
+            for w in node_weights[node.name]:
+                upload_weight(w)
+        else:
+            # ---- D: prefetch weights of the layer `prefetch_distance` ahead ----
+            # This runs *after* the previous compute step (which emitted at the end
+            # of the last loop iteration), so the copy-stream H2D genuinely
+            # overlaps with compute rather than bulk-uploading before the 1st kernel.
+            ahead = i + prefetch_distance
+            if ahead < n:
+                for w in node_weights[order[ahead].name]:
+                    upload_weight(w)
+
+            # ---- A/D: this layer's own weights, just-in-time before its compute ----
+            # Only upload here if prefetch did not already cover them (small models
+            # with prefetch_distance >= 1 will have these covered; this is the
+            # safety net so every compute step sees its weights on device).
+            for w in node_weights[node.name]:
+                upload_weight(w)
 
         # ---- B: bind output tensors to their reuse slots / pool buffers ----
         # The physical buffer is sized to the slot's max tenant (slot_sizes),
@@ -868,6 +992,27 @@ def build_execution_plan(
             plan.steps.append(PlanStep("defrag", StreamAssigner.COPY_STREAM,
                                        node=node.name,
                                        detail=f"wave-boundary compaction ({merged} holes merged)"))
+
+        # ---- A/D (streaming): free weights whose last direct use is this step ----
+        # Emitted after the compute's bindings are recorded, so the just-run node
+        # still saw its weight on device. Returning the block to the pool here is
+        # what keeps BigFormer's ~18 GB of weights from co-residing.
+        if streaming:
+            for w in node_weights[node.name]:
+                if weight_last_direct_use.get(w) == i and w in weight_alloc_obj:
+                    alloc = weight_alloc_obj.pop(w)
+                    off, nb = weight_alloc_map[w]
+                    pool.free(alloc)
+                    plan.steps.append(PlanStep("free", StreamAssigner.COPY_STREAM,
+                                               tensor=w, device_offset=off, size=nb,
+                                               detail="streamed weight reclaimed"))
+                    weight_uploaded.discard(w)
+
+    # Runtime execution schedule (C3.5 consumes this): per-node weight uploads and
+    # dead-tensor frees. Computed from the same lifetime analysis that drove the
+    # plan above, so one strategy feeds both the review artifact and the executor.
+    plan.uploads_before, plan.frees_after = _runtime_schedule(order, graph, life, streaming)
+    plan.order_names = [node.name for node in order]
 
     # Validate the plan before returning
     validate_execution_plan(plan, graph)
