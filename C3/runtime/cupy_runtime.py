@@ -52,6 +52,8 @@ class CupyRuntime:
         self.graph = graph
         self._topo = graph.topo_order()
         self._fuse_gelu()
+        self._fuse_conv_relu()      # ResNet: fold Conv->Relu into the bias epilogue
+        self._fuse_add_relu()       # ResNet: fold residual Add->Relu into one kernel
         self.streaming = streaming
         # Host-side weight store (numpy); used directly in streaming mode, and
         # as the upload source in eager mode.
@@ -155,6 +157,61 @@ class CupyRuntime:
             return
         self._topo = [fused[id(n)] if id(n) in fused else n
                       for n in self._topo if id(n) in fused or id(n) not in drop]
+
+    def _cons_map(self):
+        cons: Dict[str, list] = {}
+        for n in self._topo:
+            for i in n.inputs:
+                if i:
+                    cons.setdefault(i, []).append(n)
+        return cons
+
+    def _fuse_conv_relu(self):
+        """Fold ``Conv -> Relu`` (Relu the conv output's ONLY consumer) into the
+        conv's bias epilogue: one ``max(gemm+bias, 0)`` kernel instead of a
+        bias-add pass followed by a separate relu pass. ResNet's stem and each
+        block's first conv match this."""
+        prod = {o: n for n in self._topo for o in n.outputs if o}
+        cons = self._cons_map()
+        fused: Dict[int, Node] = {}
+        drop = set()
+        for relu in self._topo:
+            if relu.op_type != "Relu" or not relu.inputs:
+                continue
+            c = prod.get(relu.inputs[0])
+            if c is None or c.op_type != "Conv":
+                continue
+            if len(cons.get(c.outputs[0], [])) != 1:      # conv output feeds only relu
+                continue
+            fused[id(c)] = Node(name=c.name, op_type="Conv", inputs=list(c.inputs),
+                                outputs=[relu.outputs[0]],
+                                attrs={**c.attrs, "fused_relu": 1})
+            drop.add(id(relu))
+        if not fused:
+            return
+        self._topo = [fused.get(id(n), n) for n in self._topo if id(n) not in drop]
+
+    def _fuse_add_relu(self):
+        """Fold a residual ``Add -> Relu`` (Relu the add's ONLY consumer) into one
+        ``max(a+b, 0)`` kernel -- the block-output relu in every ResNet block."""
+        prod = {o: n for n in self._topo for o in n.outputs if o}
+        cons = self._cons_map()
+        fused: Dict[int, Node] = {}
+        drop = set()
+        for relu in self._topo:
+            if relu.op_type != "Relu" or not relu.inputs:
+                continue
+            a = prod.get(relu.inputs[0])
+            if a is None or a.op_type != "Add":
+                continue
+            if len(cons.get(a.outputs[0], [])) != 1:
+                continue
+            fused[id(a)] = Node(name=a.name, op_type="FusedAddRelu", inputs=list(a.inputs),
+                                outputs=[relu.outputs[0]], attrs=dict(a.attrs))
+            drop.add(id(relu))
+        if not fused:
+            return
+        self._topo = [fused.get(id(n), n) for n in self._topo if id(n) not in drop]
 
     @property
     def input_dtypes(self) -> Dict[str, Any]:

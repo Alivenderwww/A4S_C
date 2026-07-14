@@ -135,6 +135,31 @@ def op_Relu(x, **_):
     return cp.maximum(x, cp.zeros((), dtype=x.dtype))
 
 
+# Fused epilogues (one kernel / one read+write instead of two). ResNet decomposes
+# a block into Conv->Relu and (residual) Add->Relu; the runtime fuses those pairs
+# (cupy_runtime._fuse_conv_relu / _fuse_add_relu) so the trailing Relu folds into
+# the conv's bias-add or the residual add instead of being a separate pass.
+_conv_bias_relu = cp.ElementwiseKernel(
+    "float32 x, float32 b", "float32 y", "y = fmaxf(x + b, 0.0f);", "conv_bias_relu")
+_relu_kernel = cp.ElementwiseKernel(
+    "float32 x", "float32 y", "y = fmaxf(x, 0.0f);", "relu_only")
+_add_relu = cp.ElementwiseKernel(
+    "float32 a, float32 b", "float32 y", "y = fmaxf(a + b, 0.0f);", "add_relu")
+
+
+def op_FusedAddRelu(a, b, **_):
+    return _add_relu(a, b)
+
+
+def _conv_bias(out, b, fused_relu):
+    """Conv epilogue: add the (broadcast) bias and, when a Relu was fused in,
+    apply it in the SAME kernel."""
+    if b is not None:
+        bb = cp.reshape(b, (1, -1, 1, 1))
+        return _conv_bias_relu(out, bb) if fused_relu else out + bb
+    return _relu_kernel(out) if fused_relu else out
+
+
 def op_Add(a, b, **_):
     return a + b
 
@@ -246,7 +271,7 @@ def op_Identity(x, **_):
 
 
 def op_Conv(x, w, b=None, strides=None, pads=None, dilations=None,
-            group=1, kernel_shape=None, **_):
+            group=1, kernel_shape=None, fused_relu=0, **_):
     """2D convolution via im2col (NCHW) on GPU.
 
     Two fast paths:
@@ -278,9 +303,7 @@ def op_Conv(x, w, b=None, strides=None, pads=None, dilations=None,
         ws = cp.reshape(w, (oc, c))                  # (oc, c)
         out = cp.matmul(ws[None], xs)                # (1,oc,c)@(n,c,h*w)->(n,oc,h*w)
         out = cp.reshape(out, (n, oc, h, wd))
-        if b is not None:
-            out = out + cp.reshape(b, (1, -1, 1, 1))
-        return out
+        return _conv_bias(out, b, fused_relu)
 
     xp = cp.pad(x, ((0, 0), (0, 0), (pt, pb), (pl, pr)))
     oh = (xp.shape[2] - (dh * (kh - 1) + 1)) // sh + 1
@@ -315,9 +338,7 @@ def op_Conv(x, w, b=None, strides=None, pads=None, dilations=None,
             outs.append(og)
         out = cp.concatenate(outs, axis=1)
 
-    if b is not None:
-        out = out + cp.reshape(b, (1, -1, 1, 1))
-    return out
+    return _conv_bias(out, b, fused_relu)
 
 
 def _im2col(x, kh, kw, sh, sw, dh, dw, oh, ow):
