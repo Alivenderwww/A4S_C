@@ -135,7 +135,22 @@ class _CupyBackend:
         from runtime.cupy_runtime import CupyRuntime
 
         self.graph = import_onnx_graph(onnx_path)
-        self.rt = CupyRuntime(self.graph)
+        # Auto-detect weight streaming: if float weights exceed ~80% of free GPU
+        # memory, upload them on demand (BigFormer ~19GB > 17GB GPU). Otherwise
+        # upload eagerly once (faster for small models).
+        streaming = False
+        try:
+            import cupy as _cp
+            free = _cp.cuda.runtime.memGetInfo()[0]
+            weight_bytes = sum(v.nbytes for v in self.graph.initializers.values()
+                               if hasattr(v, "nbytes") and np.asarray(v).dtype.kind == "f")
+            if weight_bytes > free * 0.8:
+                streaming = True
+                print(f"[infer] weight streaming ON ({weight_bytes/1e9:.1f}GB weights > "
+                      f"{free/1e9:.1f}GB GPU free)", file=_sys.stderr)
+        except Exception:
+            pass
+        self.rt = CupyRuntime(self.graph, streaming=streaming)
         self.output_names = [t.name for t in self.graph.outputs]
         # dtype per input, mirroring _OrtBackend (used to cast feed tensors)
         from scheduler.graph import _dtype_name  # noqa: F401  (kept for parity)

@@ -136,6 +136,11 @@ def op_Constant(value=None, **_):
     return value
 
 
+def op_Identity(x, **_):
+    """Pass-through (ONNX Identity). BigFormer uses it for residual wiring."""
+    return x
+
+
 def op_Conv(x, w, b=None, strides=None, pads=None, dilations=None,
             group=1, kernel_shape=None, **_):
     """2D convolution via im2col (NCHW) on GPU.
