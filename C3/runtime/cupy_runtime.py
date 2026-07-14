@@ -70,6 +70,19 @@ class CupyRuntime:
         # it immediately after its consuming node, keeping peak memory low.
         if streaming:
             self._weight_last_use = self._compute_last_use()
+        # Last consumer (topo index) of every intermediate activation. run()
+        # drops each activation right after its final use instead of holding all
+        # ~1000 node outputs for the whole forward pass. That O(nodes x batch)
+        # activation footprint -- not the weights -- is what OOMs at large batch
+        # (bs=32 already exceeds 16 GB); freeing dead activations caps peak at
+        # the live set, so the full sample set fits in one pass and streamed
+        # weights are uploaded ONCE, not once per micro-batch.
+        self._act_last_use: Dict[str, int] = {}
+        for i, node in enumerate(self._topo):
+            for t in node.inputs:
+                if t and t not in self._init_host:
+                    self._act_last_use[t] = i
+        self._output_names = {t.name for t in graph.outputs}
 
     def _compute_last_use(self) -> Dict[str, int]:
         """tensor name -> index in topo order of its last consuming node.
@@ -118,6 +131,15 @@ class CupyRuntime:
             self._exec_node(node, env)
             if self.streaming:
                 self._free_weights_after(node, env, i)
+            # Drop intermediate activations whose last consumer was this node so
+            # the CuPy pool can reuse the block for the next one. Weights (in
+            # _init_host, freed by _free_weights_after) and graph outputs are
+            # left alone. This bounds peak to the live activation set.
+            for t in node.inputs:
+                if self._act_last_use.get(t) == i and t not in self._output_names:
+                    v = env.get(t)
+                    if v is not None and hasattr(v, "ndim") and not isinstance(v, np.ndarray):
+                        del env[t]
 
         out: Dict[str, np.ndarray] = {}
         for t in self.graph.outputs:
