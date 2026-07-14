@@ -166,6 +166,7 @@ class CupyRuntime:
         """
         if not hasattr(self, "_alias_source"):
             return
+        freed_any = False
         for t in node.inputs:
             src = self._alias_source.get(t, t)
             if self._weight_last_use.get(src) == step:
@@ -173,6 +174,16 @@ class CupyRuntime:
                     v = env.get(key)
                     if v is not None and hasattr(v, "ndim") and not isinstance(v, np.ndarray):
                         del env[key]
+                        freed_any = True
+        # Force the CuPy memory pool to actually return freed blocks to the
+        # allocator — without this ``del`` only drops the Python reference and
+        # the pool keeps the GPU block cached, so BigFormer's 19 GB of streamed
+        # weights accumulate across layers and OOM.
+        if freed_any:
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def _exec_node(self, node: Node, env: Dict[str, Any]) -> None:
