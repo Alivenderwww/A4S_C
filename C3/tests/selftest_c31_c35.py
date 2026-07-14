@@ -39,24 +39,26 @@ _SERVER_TD = {"mlp_v1": "testdata_mlp", "resnet_v1": "testdata_resnet", "transfo
 
 def _resolve_models():
     """Find the directory holding the .onnx files."""
-    repo_models = os.path.join(_REPO_PUBLIC, "models")
-    if os.path.isdir(repo_models):
-        return repo_models
+    # flat layout first: models directly under C3_ROOT
     if any(f.endswith(".onnx") for f in os.listdir(_C3_ROOT)
            if os.path.isfile(os.path.join(_C3_ROOT, f))):
         return _C3_ROOT
+    # fallback: repo layout public/.../models
+    repo_models = os.path.join(_REPO_PUBLIC, "models")
+    if os.path.isdir(repo_models):
+        return repo_models
     return repo_models  # fallback (will SKIP gracefully if missing)
 
 
 def _resolve_testdata(model_key):
     """Find the testdata dir for one model; returns parent containing input/ & golden/."""
-    # repo layout: public/.../testdata/c35/<model_key>/{input,golden}
-    repo_td = os.path.join(_REPO_PUBLIC, "testdata", "c35", model_key)
-    if os.path.isdir(os.path.join(repo_td, "input")):
-        return repo_td
-    # server layout: C3_ROOT/testdata_<short>/{input,golden}
+    # flat layout first: C3_ROOT/testdata_<short>/{input,golden}
     srv_td = os.path.join(_C3_ROOT, _SERVER_TD.get(model_key, ""))
     if os.path.isdir(os.path.join(srv_td, "input")):
+        return srv_td
+    # fallback: repo layout public/.../testdata/c35/<model_key>
+    repo_td = os.path.join(_REPO_PUBLIC, "testdata", "c35", model_key)
+    if os.path.isdir(os.path.join(repo_td, "input")):
         return srv_td
     return repo_td  # fallback (test_c35 will SKIP)
 

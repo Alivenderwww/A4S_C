@@ -1,4 +1,18 @@
 __pycache__/
 *.pyc
 benchmarks/c32_c33/results/
-*.dag.json
+results/
+
+# 推理产物
+out_*/
+wout_*/
+chk_*/
+perf_*/
+bf_*/
+reg_*/
+*_dag.json
+
+# 模型和测试数据（不提交，评测机提供）
+*.onnx
+*.onnx.data
+testdata_*/

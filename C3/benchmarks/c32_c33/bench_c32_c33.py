@@ -42,16 +42,16 @@ from runtime.mock_runtime import MockRuntime
 # not guaranteed to match the dev layout, so resolve defensively.
 def _resolve_models_dir():
     candidates = [
-        # repo layout: C3/../public/Track-C/C3-scheduler/.../models  (actual)
+        # flat layout: models directly under C3_ROOT (e.g. C3/*.onnx)
+        _C3_ROOT,
+        # C3_ROOT/models
+        os.path.join(_C3_ROOT, "models"),
+        # repo layout: C3/../public/Track-C/C3-scheduler/.../models  (fallback)
         os.path.join(_C3_ROOT, "..", "public", "Track-C",
                      "C3-scheduler", "testcases", "release_to_competitors", "models"),
         # repo layout (legacy, from upstream contest skeleton)
         os.path.join(_C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest",
                      "Track-C", "C3-scheduler", "testcases", "release_to_competitors", "models"),
-        # server/flat layout: models directly under C3_ROOT (e.g. ~/A4S/c3/*.onnx)
-        _C3_ROOT,
-        # C3_ROOT/models
-        os.path.join(_C3_ROOT, "models"),
     ]
     for d in candidates:
         if os.path.isdir(d) and any(f.endswith(".onnx") for f in os.listdir(d)):
