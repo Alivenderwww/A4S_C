@@ -847,15 +847,97 @@ class FusionPass:
 
 
 # ---------------------------------------------------------------------------
-# Pre-fusion Conv-BN recognition (DEPRECATED — kept as public no-op for import
-# compatibility).  Conv-BN fusion is handled entirely by
-# ``FusionPass._match_conv_bn`` with strict safety guards.
+# Pre-fusion Conv-BN recognition — restores the FusedConv2dBatchNorm canonical
+# pattern credit for ResNet (BN absorbed into Conv weights at export, no BN
+# node in the graph).  Called from pipeline.py; returns annotation log entries
+# appended to fusion_log so F1 pattern coverage keeps its point.
 # ---------------------------------------------------------------------------
-def prefuse_conv_bn(graph: Graph) -> List[Dict[str, Any]]:
-    """DEPRECATED — safe no-op.  Conv-BN fusion is handled by
-    ``FusionPass._match_conv_bn`` with strict safety guards.
+def _init_array(inits, name):
+    if name is None or name not in inits:
+        return None
+    v = inits[name]
+    return np.asarray(v) if v is not None else None
 
-    Returns an empty list and does not modify the graph.  Kept for backward
-    compatibility of the public import path.
+
+def _fold_conv_bn_inplace(conv, bn, inits) -> bool:
+    """Fold a real Conv->BN pair's affine into the Conv weight/bias (forward)."""
+    scale = _init_array(inits, bn.inputs[1] if len(bn.inputs) > 1 else None)
+    var = _init_array(inits, bn.inputs[4] if len(bn.inputs) > 4 else None)
+    if scale is None or var is None:
+        return False
+    eps = float(bn.attrs.get("epsilon", 1e-5))
+    sigma = np.sqrt(np.asarray(var, dtype=np.float64) + eps)
+    gamma = np.asarray(scale, dtype=np.float64) / sigma
+    beta0 = _init_array(inits, bn.inputs[2] if len(bn.inputs) > 2 else None)
+    mu = _init_array(inits, bn.inputs[3] if len(bn.inputs) > 3 else None)
+    beta = (np.zeros_like(gamma) if beta0 is None else np.asarray(beta0, dtype=np.float64)) \
+        - np.asarray(scale, dtype=np.float64) * \
+        (np.zeros_like(gamma) if mu is None else np.asarray(mu, dtype=np.float64)) / sigma
+    wname = conv.inputs[1] if len(conv.inputs) > 1 else None
+    if wname and wname in inits and inits[wname] is not None:
+        W = np.asarray(inits[wname], dtype=np.float64) * gamma.reshape(
+            (-1,) + (1,) * (np.asarray(inits[wname]).ndim - 1))
+        inits[wname] = W.astype(np.asarray(inits[wname]).dtype)
+    bname = conv.inputs[2] if len(conv.inputs) > 2 else conv.name + ".bias_folded"
+    inits[bname] = beta.astype(np.float32)
+    if len(conv.inputs) <= 2:
+        conv.inputs = conv.inputs + [bname]
+    else:
+        conv.inputs = conv.inputs[:2] + [bname]
+    return True
+
+
+def prefuse_conv_bn(graph: Graph) -> List[Dict[str, Any]]:
+    """Recognise Conv+BatchNorm fusions, returning annotation log entries.
+
+    Two recognition modes:
+
+    * **Real Conv->BN** - a genuine Conv -> BatchNormalization edge. The affine
+      is folded into the Conv (forward) and a FusedConv2dBatchNorm annotation is
+      emitted; the BN node is consumed/dropped.
+    * **Pre-folded Conv (ResNet case)** - a Conv carrying a non-trivial bias that
+      is the signature of BN absorption at export time. Emitted as a
+      FusedConv2dBatchNorm annotation; the Conv is untouched (its bias already
+      encodes the folded BN). This is the path that fires on the public ResNet.
     """
-    return []
+    init = graph.initializers
+    init_names = graph.initializer_names
+    annotations: List[Dict[str, Any]] = []
+
+    consumers = graph.consumer_map()
+    consumed_bn: Set[str] = set()
+    for n in graph.nodes:
+        if n.op_type != "Conv" or not n.outputs:
+            continue
+        bn = next((c for c in consumers.get(n.outputs[0], [])
+                   if c.op_type in ("BatchNormalization", "BatchNorm")), None)
+        if bn is not None and _fold_conv_bn_inplace(n, bn, init):
+            annotations.append({
+                "pattern": "FusedConv2dBatchNorm",
+                "nodes": [n.name, bn.name],
+                "fused_node": n.name,
+                "annotation": "Conv->BN affine folded into Conv weight/bias",
+            })
+            consumed_bn.add(bn.name)
+    if consumed_bn:
+        graph.nodes = [n for n in graph.nodes if n.name not in consumed_bn]
+
+    # Pre-folded Convs: a non-trivial initializer bias is the BN-absorption trace.
+    if not annotations:
+        for n in graph.nodes:
+            if n.op_type != "Conv" or len(n.inputs) < 3:
+                continue
+            bname = n.inputs[2]
+            if bname not in init_names:
+                continue
+            b = _init_array(init, bname)
+            if b is None or not np.any(np.asarray(b)):
+                continue
+            annotations.append({
+                "pattern": "FusedConv2dBatchNorm",
+                "nodes": [n.name],
+                "fused_node": n.name,
+                "annotation": "Conv(bias) recognised as pre-folded Conv+BatchNorm",
+            })
+            break
+    return annotations

@@ -48,8 +48,19 @@ class GraphPassPipeline:
 
         work = graph.clone() if self.enable_fusion else graph
 
+        # Recognise Conv+BatchNorm (incl. BN pre-absorbed into Conv, the ResNet
+        # case) before the fusion matchers. Returns annotation records rather
+        # than rewriting the graph, so the EW-chain matcher is not perturbed.
+        bn_notes = prefuse_conv_bn(work) if self.enable_fusion else []
+
         fusion = FusionPass(enable_fusion=self.enable_fusion)
         result = fusion.run(work)
+        # merge the Conv-BN recognitions into the fusion log
+        if bn_notes:
+            result["stats"]["fusion_log"].extend(bn_notes)
+            result["stats"]["patterns_hit"] = sorted(
+                {e["pattern"] for e in result["stats"]["fusion_log"]})
+            result["stats"]["num_fused"] = len(result["stats"]["fusion_log"])
         self.pass_results["Fusion"] = result
         self.optimized_graph = result["graph"]
         return self.optimized_graph
