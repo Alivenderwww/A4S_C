@@ -103,18 +103,42 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     if (cmp.s2.kind != ir::Operand::Reg) continue;
     const uint32_t boundReg = cmp.s2.value;
 
-    // Bail if the body has a second self-incrementing induction variable
-    // besides the counter (e.g. a strength-reduced address recurrence
-    // `ADD addr,addr,stride`). Unrolling would have to offset each such IV by
-    // c*stride per copy; not handled yet, so skip (SR already cut the body).
-    bool multiIV = false;
-    for (int i = 0; i < n - 3; ++i) {
-      const ir::Inst &in = b.insts[i];
-      if (in.op == ir::Op::ADD && in.dst.kind == ir::Operand::Reg &&
-          in.s1.kind == ir::Operand::Reg && in.s1.value == in.dst.value &&
-          in.dst.value != counter) { multiIV = true; break; }
+    // Second-class self-incrementing induction variables other than the counter.
+    // strength_reduce emits address recurrences `ADD addr,addr,stride` (dst==s1,
+    // stride loop-invariant) that we CAN unroll: each copy c just offsets the IV
+    // by c*stride (same trick as the counter). Collect them; bail on anything we
+    // can't offset (a self-ADD whose stride is NOT loop-invariant, or any other
+    // non-address self-modifying register) so we never produce wrong induction
+    // values.
+    //
+    // An "address recurrence" here is exactly the shape strength_reduce produces:
+    //   ADD ivR, ivR, strideR      with ivR != counter and strideR loop-invariant.
+    // `defs` is the set of registers defined inside the loop body (built below).
+    std::vector<uint32_t> addrIV;      // the recurrence register (ivR) per IV.
+    std::vector<uint32_t> addrStride;  // its loop-invariant stride register.
+    {
+      // defs = registers defined in the steady body (excludes the latch counter).
+      std::set<uint32_t> defs;
+      for (int i = 0; i < n - 3; ++i)
+        if (b.insts[i].dst.kind == ir::Operand::Reg)
+          defs.insert(b.insts[i].dst.value);
+      bool bail = false;
+      for (int i = 0; i < n - 3; ++i) {
+        const ir::Inst &in = b.insts[i];
+        if (in.op != ir::Op::ADD || in.dst.kind != ir::Operand::Reg) continue;
+        if (in.s1.kind != ir::Operand::Reg || in.s1.value != in.dst.value) continue;
+        if (in.dst.value == counter) continue;          // the loop counter.
+        // Self-incrementing register other than the counter. Offsettable only if
+        // its addend (s2) is a loop-invariant register: strength-reduced address
+        // recurrences always are (stride = coeff*esize, both invariant).
+        if (in.s2.kind != ir::Operand::Reg || defs.count(in.s2.value)) {
+          bail = true; break;                            // non-invariant stride.
+        }
+        addrIV.push_back(in.dst.value);
+        addrStride.push_back(in.s2.value);
+      }
+      if (bail) continue;
     }
-    if (multiIV) continue;
 
     // A constant trip that U divides needs no remainder. Otherwise (a runtime
     // bound like GEMM's K param, or a non-multiple constant) the last group has
@@ -122,6 +146,16 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     uint32_t boundConst = 0;
     const bool divisible = constOf(fn, boundReg, boundConst) && boundConst != 0 &&
                            (boundConst % (step * (uint32_t)U)) == 0;
+    // When the loop has strength-reduced address-recurrence IVs, each unrolled
+    // copy must carry an inter-copy `addr += stride` advance (correct, cheap),
+    // BUT a non-divisible trip ALSO forces a per-copy remainder-predicate
+    // (CMPP + counter offset) to guard the loads -- that overhead outweighs the
+    // loop-control savings and makes the unrolled body SLOWER than the original
+    // for a runtime trip like GEMM's K param. So only unroll an address-IV loop
+    // when the trip is provably divisible (constant bound, U | trip); for a
+    // runtime-bound address-IV loop, leave the strength-reduced single-iteration
+    // body intact (it is already tight). Skip = no change, always safe.
+    if (!addrIV.empty() && !divisible) continue;
 
     // Loop-carried set (kept shared across copies); the counter is shifted.
     std::set<uint32_t> carried;
@@ -142,6 +176,9 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     // file -- skipping only forfeits the speedup, unrolling into a spill would
     // be WRONG. This is what makes unroll safe at -O2 (the default level,
     // applied to every kernel incl. register-pressure mutations).
+    //
+    // Address-recurrence IVs are SHARED across copies (not per-copy), so they do
+    // not multiply by U; only the steady-state temps do.
     const size_t estRegs =
         carried.size() + steadyDefs.size() * (size_t)U + 2u * (size_t)(U - 1);
     if (estRegs > (size_t)(kRegisterCount * 3 / 4)) continue;   // ~192 of 256
@@ -184,6 +221,17 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     }
 
     // --- build the unrolled instruction list -----------------------------
+    // Each copy c (c=0..U-1) uses its own per-copy temporaries (steadyDefs) and
+    // a copy-specific COUNTER value counter + c*step so the U copies see the
+    // right loop index for their remainder checks. The address-recurrence IVs
+    // stay SHARED (loop-carried): rather than recomputing iv + c*stride per copy
+    // (expensive), we keep the recurrence and advance each address IV by ONE
+    // stride between consecutive copies (and once more in the tail), so the U
+    // loads land at iv, iv+stride, ..., iv+(U-1)*stride -- exactly the original
+    // recurrence, just with U loads per outer iteration. The recurrence
+    // self-increment from the original body is dropped; the inter-copy + tail
+    // advances replace it.
+    std::set<uint32_t> addrIVSet(addrIV.begin(), addrIV.end());
     std::vector<ir::Inst> out;
     for (int c = 0; c < U; ++c) {
       std::map<uint32_t, uint32_t> ren;
@@ -192,7 +240,11 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
         ren[*it] = fn.regs.nextVReg++;                 // fresh temp per copy.
 
       int pc = -1;
-      if (c > 0) {
+      if (c > 0 && !divisible) {
+        // Non-divisible trip: each copy c>=1 needs its own counter value
+        // counter+c*step only to evaluate the remainder predicate p_c (which
+        // guards the copy's loads against an out-of-range K). On a divisible
+        // trip this is unnecessary, so skip the (dead) offset entirely.
         uint32_t cimm = fn.regs.nextVReg++;            // LOADI c*step
         uint32_t ivc  = fn.regs.nextVReg++;            // iv_c = counter + c*step
         ren[counter] = ivc;
@@ -203,17 +255,21 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
         ad.dst = ir::Operand::reg(ivc);
         ad.s1 = ir::Operand::reg(counter); ad.s2 = ir::Operand::reg(cimm);
         out.push_back(ad);
-        if (!divisible) {
-          pc = remPred[c - 1];                         // p_c = G && (iv_c < bound)
-          ir::Inst cp = cmp;                           // same CMPP.lt.<type>, s2=bound
-          cp.dst = ir::Operand::pred((uint32_t)pc);
-          cp.s1 = ir::Operand::reg(ivc);
-          cp.guard = bodyGuard;
-          out.push_back(cp);
-        }
+        pc = remPred[c - 1];                           // p_c = G && (iv_c < bound)
+        ir::Inst cp = cmp;                             // same CMPP.lt.<type>, s2=bound
+        cp.dst = ir::Operand::pred((uint32_t)pc);
+        cp.s1 = ir::Operand::reg(ivc);
+        cp.guard = bodyGuard;
+        out.push_back(cp);
       }
       for (int i = 0; i < n - 3; ++i) {
         ir::Inst in = b.insts[i];
+        // Skip the address-recurrence self-increment: the unrolled loop advances
+        // each address IV by one stride between copies (below), and the net
+        // advance over U copies is U*stride -- exactly what the next outer
+        // iteration needs.
+        if (in.op == ir::Op::ADD && in.dst.kind == ir::Operand::Reg &&
+            addrIVSet.count(in.dst.value)) continue;
         const bool carriedWrite = in.dst.kind == ir::Operand::Reg &&
                                   carried.count(in.dst.value) != 0;
         renameOperand(in.dst, ren);
@@ -224,9 +280,26 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
           in.guard = pc;                               // off past bound
         out.push_back(in);
       }
+      // Advance every address-recurrence IV by one stride after this copy, so the
+      // next copy's loads land at iv+stride, iv+2*stride, ... (the final advance,
+      // after copy U-1, leaves the IV at start+U*stride for the next outer
+      // iteration). For a non-divisible trip, the copy already ran under guard
+      // `pc`; an out-of-range advance of the address IV is harmless arithmetic
+      // (it touches no memory), but we still must not read memory from it, which
+      // the guarded load already guarantees -- so the advance is unconditional.
+      for (unsigned a = 0; a < addrIV.size(); ++a) {
+        ir::Inst adv; adv.op = ir::Op::ADD; adv.type = ir::Type::U32;
+        adv.dst = ir::Operand::reg(addrIV[a]);
+        adv.s1 = ir::Operand::reg(addrIV[a]);
+        adv.s2 = ir::Operand::reg(addrStride[a]);
+        out.push_back(adv);
+      }
     }
 
     // counter += U*step ; then the (unchanged) CMPP + BRX.
+    // (The address-recurrence IVs are NOT advanced here: each copy already emits
+    // a `iv += stride` advance after its body, so after copy U-1 the IVs sit at
+    // start+U*stride, which is exactly the next outer iteration's entry value.)
     uint32_t ustepReg = fn.regs.nextVReg++;
     ir::Inst li; li.op = ir::Op::LOADI; li.type = ir::Type::U32;
     li.dst = ir::Operand::reg(ustepReg); li.hasImm = true; li.imm = step * (uint32_t)U;
