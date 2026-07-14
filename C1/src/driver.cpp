@@ -264,6 +264,7 @@ bool compile(const ptx::Module &m, const Options &opt, binfmt::Image &image,
     passes::unrollLoops(fn, opt);                   // cut per-iteration loop control.
   }
   sched::listSchedule(fn, opt);   // pre-RA: schedule on vregs (fewer false deps).
+  regalloc::predAlloc(fn, opt);   // map virtual predicates -> P0..P7 (+GPR spill).
   const uint64_t estCycles = estimateCyclesIR(fn);   // pre-RA: vregs unique.
   regalloc::linearScan(fn, opt);
 

@@ -10,15 +10,19 @@
 // This version computes real per-block liveness (backward dataflow to a
 // fixpoint over the CFG, so back-edges extend ranges over the whole loop),
 // derives an interval per virtual register from live-in/live-out + def/use
-// positions, then does the standard linear scan (assign R1..R255, expire on
-// interval end). Spilling is a STUB (clamp to the top register + count), but at
-// -O2 the spill path is effectively unreachable: the pre-RA list scheduler
-// sinks each independent value to its use, so peak pressure stays tiny -- a
-// kernel with 300 simultaneously-defined runtime values allocates ~6 physical
-// registers and 0 spills (measured; see sim/cmodel/pressure.py). Reaching a
-// spill needs >255 values live at one point with no schedule that separates
-// them, which the scalar §3 subset (binary ops, no offset addressing) makes
-// pathological. So a full lmem spiller is deliberately not implemented.
+// positions, then does the standard linear scan (expire on interval end).
+//
+// Narrow (32-bit) register pressure that exceeds the file is spilled for real:
+// the top of the register file (R251..R255) is reserved as reload/store scratch
+// and over-pressure values are evicted to per-thread .lmem (SpillAtInterval,
+// with LD.lmem/ST.lmem materialized around each use/def in section 6). At -O2
+// the pre-RA list scheduler sinks each independent value to its use, so peak
+// pressure normally stays tiny -- a kernel with 300 simultaneously-defined
+// values allocates ~6 physical registers and spills nothing, and the output is
+// byte-identical to the old R1..R255 scan. The spiller only engages once >250
+// values are genuinely live at one point, which the scalar §3 subset makes rare
+// but no longer a silent miscompile. Wide (64-bit pair) overflow is not spilled
+// yet and clamps to the top allocatable pair; see the note in section 5.
 #include "aec/passes.h"
 #include "aec/target.h"
 
@@ -55,6 +59,36 @@ void instRegs(const ir::Inst &in, std::vector<uint32_t> &uses, int &defReg) {
   for (int k = 0; k < 3; ++k)
     if (srcs[k]->kind == ir::Operand::Reg) uses.push_back(srcs[k]->value);
   if (in.dst.kind == ir::Operand::Reg) defReg = (int)in.dst.value;
+}
+
+// LMEM spill helpers.  A slot is one 32-bit word at byte offset slot*4 in the
+// per-thread .lmem window; the address must be materialized into a register
+// because LD/ST take only [Ra] (no immediate offset, spec §5.2).  `addr` is the
+// address-scratch register, `val` the value-scratch register holding the datum.
+void emitReload(std::vector<ir::Inst> &out, int addr, int val, int slot) {
+  ir::Inst li; li.op = ir::Op::LOADI; li.type = ir::Type::NONE;
+  li.dst = ir::Operand::phys((uint32_t)addr);
+  li.hasImm = true; li.imm = (uint32_t)slot * 4u;
+  out.push_back(li);
+  ir::Inst ld; ld.op = ir::Op::LD; ld.type = ir::Type::B32;
+  ld.modifier = (uint32_t)isa::Space::LMEM;
+  ld.dst = ir::Operand::phys((uint32_t)val);
+  ld.s1 = ir::Operand::phys((uint32_t)addr);
+  ld.note = "reload";
+  out.push_back(ld);
+}
+
+void emitStore(std::vector<ir::Inst> &out, int addr, int val, int slot) {
+  ir::Inst li; li.op = ir::Op::LOADI; li.type = ir::Type::NONE;
+  li.dst = ir::Operand::phys((uint32_t)addr);
+  li.hasImm = true; li.imm = (uint32_t)slot * 4u;
+  out.push_back(li);
+  ir::Inst st; st.op = ir::Op::ST; st.type = ir::Type::B32;
+  st.modifier = (uint32_t)isa::Space::LMEM;
+  st.s1 = ir::Operand::phys((uint32_t)addr);
+  st.s2 = ir::Operand::phys((uint32_t)val);
+  st.note = "spill";
+  out.push_back(st);
 }
 
 } // namespace
@@ -158,12 +192,31 @@ void linearScan(ir::Function &fn, const Options & /*opt*/) {
     }
   if (std::getenv("AEC_NO_PAIR")) wide.clear();   // A/B knob: disable pair-awareness.
 
-  // --- 5. Pair-aware linear scan. R0 = scratch; R1..255 allocatable. -------
+  // --- 5. Pair-aware linear scan with real narrow (b32) spill. ------------
+  // Reserve the top of the register file as spill scratch so a reload/store
+  // always has a physical register to land in:  R251 = LMEM byte-offset address
+  // and R252..R255 = the reloaded/spilled values.  An instruction reads/writes
+  // at most four distinct registers (FMA: dst + 3 sources), so four value-
+  // scratch registers always cover its spilled operands.  Allocatable range is
+  // R1..R250.  Realistic kernels peak at a handful of live values (the pre-RA
+  // list scheduler sinks each value to its use), so the reservation is
+  // invisible until pressure actually exceeds 250 -- exactly the regime where a
+  // spill is required.  When nothing spills the output is byte-identical to the
+  // old R1..R255 scan.  Wide (64-bit pair) overflow is not spilled yet: it
+  // clamps to the top allocatable pair (kept out of the R251..R255 scratch
+  // band); genuine >125 simultaneously-live pairs remain a known gap.
+  const int kAllocTop    = (int)kRegisterCount - 6;   // R250: last allocatable.
+  const int kAddrScratch = (int)kRegisterCount - 5;   // R251: LMEM address.
+  const int kValScratch0 = (int)kRegisterCount - 4;   // R252..R255: values.
+
   std::set<int> freeSet;
-  for (int r = 1; r < (int)kRegisterCount; ++r) freeSet.insert(r);
+  for (int r = 1; r <= kAllocTop; ++r) freeSet.insert(r);
   std::vector<int> active;               // indices into ivs, expired lazily.
   std::map<uint32_t, int> physOf;
+  std::set<uint32_t> spilled;            // vregs with no physical register.
+  std::map<uint32_t, int> slotOf;        // spilled vreg -> LMEM slot index.
   uint32_t spillCount = 0, maxPhys = 0;
+  int nextSlot = 0;
 
   for (unsigned i = 0; i < ivs.size(); ++i) {
     std::vector<int> keep;
@@ -176,35 +229,115 @@ void linearScan(ir::Function &fn, const Options & /*opt*/) {
     }
     active.swap(keep);
 
-    int reg = -1;
     if (wide.count(ivs[i].vreg)) {                            // needs a pair.
+      int reg = -1;
       for (std::set<int>::iterator it = freeSet.begin(); it != freeSet.end(); ++it)
-        if (*it + 1 < (int)kRegisterCount && freeSet.count(*it + 1)) { reg = *it; break; }
+        if (*it + 1 <= kAllocTop && freeSet.count(*it + 1)) { reg = *it; break; }
       if (reg >= 0) { freeSet.erase(reg); freeSet.erase(reg + 1); }
-      else { reg = (int)kRegisterCount - 2; ++spillCount; }   // pair spill stub.
+      else { reg = kAllocTop - 1; ++spillCount; }   // pair-overflow clamp (gap).
+      ivs[i].phys = reg;
+      physOf[ivs[i].vreg] = reg;
+      active.push_back((int)i);
       if ((uint32_t)(reg + 1) > maxPhys) maxPhys = (uint32_t)(reg + 1);
-    } else {
-      if (!freeSet.empty()) { reg = *freeSet.begin(); freeSet.erase(reg); }
-      else { reg = (int)kRegisterCount - 1; ++spillCount; }
-      if ((uint32_t)reg > maxPhys) maxPhys = (uint32_t)reg;
+      continue;
     }
-    ivs[i].phys = reg;
-    physOf[ivs[i].vreg] = reg;
-    active.push_back((int)i);
-  }
 
-  // --- 6. Rewrite Reg operands to their physical register. ----------------
-  for (unsigned b = 0; b < nb; ++b) {
-    for (unsigned i = 0; i < fn.blocks[b].insts.size(); ++i) {
-      ir::Inst &in = fn.blocks[b].insts[i];
-      ir::Operand *ops[4] = {&in.dst, &in.s1, &in.s2, &in.s3};
-      for (int k = 0; k < 4; ++k) {
-        if (ops[k]->kind == ir::Operand::Reg) {
-          std::map<uint32_t, int>::iterator it = physOf.find(ops[k]->value);
-          *ops[k] = ir::Operand::phys((uint32_t)(it != physOf.end() ? it->second : 0));
-        }
-      }
+    if (!freeSet.empty()) {                                   // free register: assign.
+      int reg = *freeSet.begin(); freeSet.erase(reg);
+      ivs[i].phys = reg;
+      physOf[ivs[i].vreg] = reg;
+      active.push_back((int)i);
+      if ((uint32_t)reg > maxPhys) maxPhys = (uint32_t)reg;
+      continue;
     }
+
+    // No free register -> spill (Poletto & Sarkar SpillAtInterval): evict the
+    // longest-lived narrow value.  If some active interval outlives i, take its
+    // register for i and spill it; otherwise spill i itself.
+    int victimA = -1, victimEnd = ivs[i].end;
+    for (unsigned a = 0; a < active.size(); ++a) {
+      const Interval &e = ivs[active[a]];
+      if (!wide.count(e.vreg) && e.end > victimEnd) { victimEnd = e.end; victimA = (int)a; }
+    }
+    if (victimA >= 0) {
+      Interval &v = ivs[active[victimA]];
+      int reg = v.phys;
+      spilled.insert(v.vreg); slotOf[v.vreg] = nextSlot++; physOf[v.vreg] = -1;
+      v.phys = -1;
+      active.erase(active.begin() + victimA);
+      ivs[i].phys = reg;
+      physOf[ivs[i].vreg] = reg;
+      active.push_back((int)i);
+      if ((uint32_t)reg > maxPhys) maxPhys = (uint32_t)reg;
+    } else {
+      spilled.insert(ivs[i].vreg); slotOf[ivs[i].vreg] = nextSlot++;
+      ivs[i].phys = -1; physOf[ivs[i].vreg] = -1;
+    }
+  }
+  spillCount += (uint32_t)spilled.size();
+  if (!spilled.empty()) maxPhys = kRegisterCount - 1;   // scratch band in use.
+
+  // --- 6. Rewrite Reg operands to physical registers, materializing spills. -
+  // Fast path (no spill): rewrite in place, byte-identical to the old scan.
+  // Spill path: rebuild each block, reloading every spilled source into a
+  // value-scratch register just before the instruction and storing a spilled
+  // destination back to its slot just after.
+  for (unsigned b = 0; b < nb; ++b) {
+    ir::BasicBlock &blk = fn.blocks[b];
+    if (spilled.empty()) {
+      for (unsigned i = 0; i < blk.insts.size(); ++i) {
+        ir::Inst &in = blk.insts[i];
+        ir::Operand *ops[4] = {&in.dst, &in.s1, &in.s2, &in.s3};
+        for (int k = 0; k < 4; ++k)
+          if (ops[k]->kind == ir::Operand::Reg) {
+            std::map<uint32_t, int>::iterator it = physOf.find(ops[k]->value);
+            *ops[k] = ir::Operand::phys((uint32_t)(it != physOf.end() ? it->second : 0));
+          }
+      }
+      continue;
+    }
+
+    std::vector<ir::Inst> out;
+    out.reserve(blk.insts.size());
+    for (unsigned i = 0; i < blk.insts.size(); ++i) {
+      ir::Inst in = blk.insts[i];
+      ir::Operand *ops[4] = {&in.dst, &in.s1, &in.s2, &in.s3};
+
+      // Assign a distinct value-scratch register to each spilled operand vreg
+      // (<=4 distinct -> R252..R255).
+      std::map<uint32_t, int> scr;
+      int nextScr = kValScratch0;
+      for (int k = 0; k < 4; ++k)
+        if (ops[k]->kind == ir::Operand::Reg && spilled.count(ops[k]->value)
+            && !scr.count(ops[k]->value))
+          scr[ops[k]->value] = nextScr++;
+
+      const bool dstSpill = in.dst.kind == ir::Operand::Reg && spilled.count(in.dst.value);
+      const uint32_t dstVreg = dstSpill ? in.dst.value : 0;
+
+      // Reload each spilled source (once per distinct vreg) before `in`.
+      std::set<uint32_t> reloaded;
+      ir::Operand *srcs[3] = {&in.s1, &in.s2, &in.s3};
+      for (int k = 0; k < 3; ++k)
+        if (srcs[k]->kind == ir::Operand::Reg && spilled.count(srcs[k]->value)
+            && reloaded.insert(srcs[k]->value).second)
+          emitReload(out, kAddrScratch, scr[srcs[k]->value], slotOf[srcs[k]->value]);
+
+      // Rewrite operands: spilled -> its scratch, others -> physical register.
+      for (int k = 0; k < 4; ++k)
+        if (ops[k]->kind == ir::Operand::Reg) {
+          std::map<uint32_t, int>::iterator s = scr.find(ops[k]->value);
+          if (s != scr.end()) { *ops[k] = ir::Operand::phys((uint32_t)s->second); continue; }
+          std::map<uint32_t, int>::iterator it = physOf.find(ops[k]->value);
+          int p = (it != physOf.end() && it->second >= 0) ? it->second : 0;
+          *ops[k] = ir::Operand::phys((uint32_t)p);
+        }
+      out.push_back(in);
+
+      // Store a spilled destination back to its slot after `in`.
+      if (dstSpill) emitStore(out, kAddrScratch, scr[dstVreg], slotOf[dstVreg]);
+    }
+    blk.insts.swap(out);
   }
 
   fn.regs.maxPhys = maxPhys;

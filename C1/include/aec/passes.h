@@ -47,6 +47,7 @@ bool unrollLoops(ir::Function &fn, const Options &opt);  // unroll.cpp
 
 // --- Register allocation (scoring category T4). ---------------------------
 namespace regalloc {
+void predAlloc(ir::Function &fn, const Options &opt);    // pred_alloc.cpp
 void linearScan(ir::Function &fn, const Options &opt);   // linear_scan.cpp
 }
 

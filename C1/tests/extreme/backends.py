@@ -374,6 +374,11 @@ def build_cmodel_command(
         "--instructions", str(ninstr),
         "--grid", f"{grid[0]},{grid[1]},{grid[2]}",
         "--block", f"{block[0]},{block[1]},{block[2]}",
+        # Architectural per-thread .lmem window (spec §A.1).  The official grader
+        # always sets this (see PUBLIC_AEC_PRECISE_COMMANDS.md); without it the
+        # CModel gives a 0-byte LMEM and every register spill (LD.lmem/ST.lmem)
+        # traps "store out of bounds".
+        "--lmem-size", "4096",
         "--load", f"pmem:0:{pmem_path}",
         "--load", f"gmem:0:{gmem_path}",
         "--dump", f"{dump_offset}:{dump_bytes}:{dump_path}",
