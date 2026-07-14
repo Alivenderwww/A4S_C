@@ -195,6 +195,28 @@ def op_FusedGelu(h, **_):
     return _gelu_kernel(h)
 
 
+# GELU with the projection bias folded in: gelu(h + b), one kernel instead of a
+# separate bias-add pass then the gelu. `b` broadcasts over the last dim.
+_gelu_bias_kernel = cp.ElementwiseKernel(
+    "float32 h, float32 b", "float32 y",
+    "float x = h + b; y = 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));",
+    "fused_gelu_bias")
+
+
+def op_FusedGeluBias(h, b, **_):
+    return _gelu_bias_kernel(h, b)
+
+
+# Residual with the projection bias folded in: matmul + bias + residual, one
+# kernel instead of a bias-add pass then the residual add. `b` broadcasts.
+_add3_kernel = cp.ElementwiseKernel(
+    "float32 a, float32 b, float32 c", "float32 y", "y = a + b + c;", "fused_add3")
+
+
+def op_FusedAdd3(a, b, c, **_):
+    return _add3_kernel(a, b, c)
+
+
 def op_Sqrt(x, **_):
     return cp.sqrt(x)
 

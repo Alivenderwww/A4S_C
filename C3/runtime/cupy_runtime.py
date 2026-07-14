@@ -52,6 +52,7 @@ class CupyRuntime:
         self.graph = graph
         self._topo = graph.topo_order()
         self._fuse_gelu()
+        self._fuse_matmul_bias()    # BigFormer/Transformer: fold MatMul bias-add into gelu / residual
         self._fuse_conv_relu()      # ResNet: fold Conv->Relu into the bias epilogue
         self._fuse_add_relu()       # ResNet: fold residual Add->Relu into one kernel
         self.streaming = streaming
@@ -165,6 +166,52 @@ class CupyRuntime:
                 if i:
                     cons.setdefault(i, []).append(n)
         return cons
+
+    def _fuse_matmul_bias(self):
+        """Fold a MatMul bias-add ``Add(matmul, weight_bias)`` into its SINGLE
+        consumer, eliminating the standalone bias-add pass:
+          * consumer FusedGelu  -> FusedGeluBias(matmul, bias) = gelu(matmul+bias)
+          * consumer (residual) Add -> FusedAdd3(matmul, bias, other)
+        Runs AFTER _fuse_gelu so the FFN bias-add already feeds a FusedGelu. The
+        bias stays an input of the fused node, so the memory plan still streams
+        it (the plan is built after all fusion)."""
+        init = self.graph.initializer_names
+        prod = {o: n for n in self._topo for o in n.outputs if o}
+        cons = self._cons_map()
+        drop = set()
+        replace: Dict[int, Node] = {}
+        for badd in self._topo:
+            if badd.op_type != "Add" or len(badd.inputs) != 2:
+                continue
+            a, b = badd.inputs
+            pa, pb = prod.get(a), prod.get(b)
+            if pa is not None and pa.op_type == "MatMul" and b in init:
+                mm, bias = a, b
+            elif pb is not None and pb.op_type == "MatMul" and a in init:
+                mm, bias = b, a
+            else:
+                continue
+            outs = cons.get(badd.outputs[0], [])
+            if len(outs) != 1:
+                continue
+            cnode = outs[0]
+            if id(cnode) in drop or id(cnode) in replace:
+                continue
+            if cnode.op_type == "FusedGelu":
+                replace[id(cnode)] = Node(name=cnode.name, op_type="FusedGeluBias",
+                                          inputs=[mm, bias], outputs=list(cnode.outputs),
+                                          attrs=dict(cnode.attrs))
+                drop.add(id(badd))
+            elif cnode.op_type == "Add" and len(cnode.inputs) == 2:
+                other = (cnode.inputs[0] if cnode.inputs[1] == badd.outputs[0]
+                         else cnode.inputs[1])
+                replace[id(cnode)] = Node(name=cnode.name, op_type="FusedAdd3",
+                                          inputs=[mm, bias, other], outputs=list(cnode.outputs),
+                                          attrs=dict(cnode.attrs))
+                drop.add(id(badd))
+        if not drop:
+            return
+        self._topo = [replace.get(id(n), n) for n in self._topo if id(n) not in drop]
 
     def _fuse_conv_relu(self):
         """Fold ``Conv -> Relu`` (Relu the conv output's ONLY consumer) into the
