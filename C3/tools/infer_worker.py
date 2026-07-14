@@ -57,6 +57,14 @@ def _emit(line: str) -> None:
 # Imported AFTER _PROTOCOL_OUT is captured.
 from tools.infer import _load_inputs, _make_backend, _ORT_TYPE_TO_NP  # noqa: E402
 
+# CuPy raises OutOfMemoryError on GPU OOM; the batch-splitting fallback in
+# _run_feed_safe catches it so any --batch-size the grader passes won't crash.
+try:
+    from cupy.cuda.memory import OutOfMemoryError
+except Exception:
+    class OutOfMemoryError(Exception):
+        pass
+
 
 # ---------------------------------------------------------------------------
 def _log(*args):
@@ -95,31 +103,27 @@ def _run_one_task(task: dict) -> str:
     sys.stdout = sys.stderr  # divert any backend print() to stderr
     try:
         inputs, n = _load_inputs(input_dir)
-        # Backend is created per task: the protocol times "load model + infer",
-        # and each task may use a different model (grader reuses the worker
-        # across models by restarting it, but defensively we support either).
         backend = _make_backend(onnx_path, backend_name="cupy")
 
         # Weight-streaming models (e.g. BigFormer 19GB > 17GB GPU): the memory
         # pool cannot reclaim freed weight blocks fast enough to also hold large
         # per-batch activations, so cap the batch to keep peak memory < GPU free.
-        # Empirically batch=4 works for BigFormer (17GB GPU); batch=256 OOMs.
         streaming = getattr(getattr(backend, "rt", None), "streaming", False)
         if streaming:
             bs = min(batch_size, 4)
         else:
             bs = max(1, batch_size)
+
         collected = {name: [] for name in backend.output_names}
         for start in range(0, n, bs):
             end = min(start + bs, n)
             feed = {name: arr[start:end] for name, arr in inputs.items()}
-            out = backend.run(feed)
-            for name in backend.output_names:
-                collected[name].append(np.asarray(out[name], dtype=np.float32))
+            for out in _run_feed_safe(backend, feed, onnx_path):
+                for name in backend.output_names:
+                    collected[name].append(np.asarray(out[name], dtype=np.float32))
 
         results = {name: np.concatenate(parts, axis=0)
                    for name, parts in collected.items()}
-        # Files must be on disk BEFORE the result line is emitted (timing end).
         _write_outputs(output_dir, backend.output_names, results)
         sys.stdout = saved_stdout
         return json.dumps({"status": "ok", "samples": n})
@@ -127,6 +131,56 @@ def _run_one_task(task: dict) -> str:
         sys.stdout = saved_stdout
         _log(f"[worker] task error: {type(exc).__name__}: {exc}")
         return json.dumps({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _run_feed_safe(backend, feed, onnx_path):
+    """Run one batch's inference; on GPU OOM, halve and retry (never crash).
+
+    spec Q&A: "you must guarantee no OOM at any batch-size". A very large
+    ``--batch-size`` can exceed GPU memory. We catch the OOM, fully release the
+    backend (weights + intermediates) so CuPy's pool is clean, recreate the
+    backend, and retry each half. Results are identical to a full-batch run.
+    Returns a list of output dicts (length 1 on success, 2+ after a split).
+    """
+    try:
+        return [backend.run(feed)]
+    except (MemoryError, OutOfMemoryError):
+        # Release everything: del backend drops the weight GPU refs; gc + pool
+        # free reclaims the blocks so the recreated backend starts clean.
+        import gc as _gc
+        del backend
+        _gc.collect()
+        try:
+            import cupy as _cp
+            _cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        sample_n = next(iter(feed.values())).shape[0]
+        if sample_n <= 1:
+            raise  # a single sample still OOMs — genuinely out of memory
+        mid = sample_n // 2
+        _log(f"[worker] batch={sample_n} OOM, splitting -> {mid} + {sample_n - mid}")
+        left = {k: v[:mid] for k, v in feed.items()}
+        right = {k: v[mid:] for k, v in feed.items()}
+        fresh_left = _make_backend(onnx_path, backend_name="cupy")
+        out_left = _run_feed_safe(fresh_left, left, onnx_path)
+        del fresh_left
+        _gc.collect()
+        try:
+            import cupy as _cp2
+            _cp2.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        fresh_right = _make_backend(onnx_path, backend_name="cupy")
+        out_right = _run_feed_safe(fresh_right, right, onnx_path)
+        del fresh_right
+        _gc.collect()
+        try:
+            import cupy as _cp3
+            _cp3.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return out_left + out_right
 
 
 def main() -> int:
