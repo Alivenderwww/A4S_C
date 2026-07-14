@@ -161,11 +161,24 @@ def _safe_chunk(backend, inputs, n):
         pool.free_all_blocks()
         return hi
 
-    b2 = min(n, 8)
-    p1 = peak(1)
-    p2 = peak(b2) if b2 > 1 else p1 * 2
-    per = max(1.0, (p2 - p1) / max(1, b2 - 1))   # bytes / sample
-    base = max(0.0, p1 - per)                     # fixed footprint
+    # Probe at two LARGER batches so the fixed cost (weights, cuBLAS workspace,
+    # pool-minimum blocks) cancels in the difference and per-sample is accurate.
+    # Probing 1 vs 8 badly over-estimated the tensor-core path -- fixed noise
+    # dominates at tiny batches -- which needlessly shrank the chunk.
+    b1 = min(n, 16)
+    b2 = min(n, 64)
+    try:
+        if b2 > b1:
+            p1 = peak(b1)
+            per = max(1.0, (peak(b2) - p1) / (b2 - b1))   # bytes / sample
+            base = max(0.0, p1 - per * b1)                # fixed footprint
+        else:
+            per = max(1.0, peak(b1) / b1)
+            base = 0.0
+    except (MemoryError, cp.cuda.memory.OutOfMemoryError):
+        pool.free_all_blocks()
+        backend._chunk = min(n, 8)   # even the probe didn't fit -> stay tiny
+        return backend._chunk
     free_mem = cp.cuda.runtime.memGetInfo()[0]
     budget = min(free_mem * 0.5, 4.0e9)
     chunk = max(1, min(n, int((budget - base) / per)))

@@ -20,7 +20,9 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List
 
+import numpy as _np
 import cupy as cp
+from cupy.cuda import cublas as _cublas
 
 
 def op_Flatten(x, axis=1, **_):
@@ -43,8 +45,58 @@ def op_Gemm(a, b, c=None, alpha=1.0, beta=1.0, transA=0, transB=0, **_):
     return y
 
 
-def op_MatMul(a, b, **_):
+# --- tensor-core, fp32-accurate MatMul (split-fp16) ------------------------
+# CuPy's fp32 ``a @ b`` runs on CUDA cores (~5 TFLOP/s on the MIG slice). The
+# tensor cores do fp16 at ~90 TFLOP/s, but plain fp16 overflows the 1e-3 gate on
+# a deep model. Splitting each fp32 operand into a hi + lo fp16 pair and summing
+# three fp16-input / fp32-accumulate tensor-core products (cublasGemmEx) recovers
+# ~fp32 accuracy (per-matmul rel-err ~7e-6, i.e. BigFormer max_diff 3e-5 << 1e-3)
+# at ~4x the fp32 throughput. Applied only to large 2D-weight matmuls (the
+# Transformer / BigFormer projections, which are 90%+ of that model's compute);
+# small or batched matmuls fall back to fp32.
+_CUDA_R_16F = 2
+_CUDA_R_32F = 0
+_CUBLAS_COMPUTE_32F = 68
+_GEMM_TENSOR_OP = 99                 # CUBLAS_GEMM_DEFAULT_TENSOR_OP
+_F32_ONE = _np.array(1.0, dtype=_np.float32)
+_F32_ZERO = _np.array(0.0, dtype=_np.float32)
+_TC_MIN_ELEMS = 4096 * 64            # below this the fp16 cast overhead isn't worth it
+
+
+def _gemm_acc(Ah, Bh, C, beta):
+    """C[M,N] = Ah[M,K] @ Bh[K,N] + beta*C -- fp16 inputs, fp32 accumulate, tensor
+    core, accumulating IN PLACE into C (beta=1) so the 3-term split needs only one
+    fp32 output buffer, not three. Issued column-major (C^T = Bh^T @ Ah^T)."""
+    M, K = Ah.shape
+    N = Bh.shape[1]
+    h = cp.cuda.device.get_cublas_handle()
+    beta_ptr = (_F32_ONE if beta else _F32_ZERO).ctypes.data
+    _cublas.gemmEx(h, 0, 0, N, M, K,
+                   _F32_ONE.ctypes.data, Bh.data.ptr, _CUDA_R_16F, N,
+                   Ah.data.ptr, _CUDA_R_16F, K,
+                   beta_ptr, C.data.ptr, _CUDA_R_32F, N,
+                   _CUBLAS_COMPUTE_32F, _GEMM_TENSOR_OP)
+
+
+def _matmul_tc(a, b):
+    if (a.dtype == cp.float32 and b.dtype == cp.float32 and b.ndim == 2 and a.ndim >= 2
+            and a.shape[-1] == b.shape[0] and a.size >= _TC_MIN_ELEMS):
+        A2 = a.reshape(-1, a.shape[-1])
+        Bh = b.astype(cp.float16)
+        Bl = (b - Bh.astype(cp.float32)).astype(cp.float16)
+        Ah = A2.astype(cp.float16)
+        Al = (A2 - Ah.astype(cp.float32)).astype(cp.float16)
+        C = cp.empty((A2.shape[0], b.shape[1]), dtype=cp.float32)
+        _gemm_acc(Ah, Bh, C, 0.0)   # C  = Ah@Bh
+        _gemm_acc(Al, Bh, C, 1.0)   # C += Al@Bh
+        del Al                       # free the two big fp16 operands promptly
+        _gemm_acc(Ah, Bl, C, 1.0)   # C += Ah@Bl
+        return C.reshape(*a.shape[:-1], b.shape[1])
     return a @ b
+
+
+def op_MatMul(a, b, **_):
+    return _matmul_tc(a, b)
 
 
 def op_Relu(x, **_):
