@@ -130,8 +130,12 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
         if (in.dst.value == counter) continue;          // the loop counter.
         // Self-incrementing register other than the counter. Offsettable only if
         // its addend (s2) is a loop-invariant register: strength-reduced address
-        // recurrences always are (stride = coeff*esize, both invariant).
-        if (in.s2.kind != ir::Operand::Reg || defs.count(in.s2.value)) {
+        // recurrences always are (stride = coeff*esize, both invariant). The
+        // latch counter is deliberately NOT in `defs`, so guard it explicitly:
+        // `ADD x,x,counter` (a running index sum) has a loop-VARIANT stride and
+        // must not be mistaken for an address recurrence.
+        if (in.s2.kind != ir::Operand::Reg || defs.count(in.s2.value) ||
+            in.s2.value == counter) {
           bail = true; break;                            // non-invariant stride.
         }
         addrIV.push_back(in.dst.value);
@@ -232,6 +236,24 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     // self-increment from the original body is dropped; the inter-copy + tail
     // advances replace it.
     std::set<uint32_t> addrIVSet(addrIV.begin(), addrIV.end());
+
+    // Does the steady body READ the loop counter (as a value or a non-strength-
+    // reduced address term)? If so, every copy must get its own counter+c*step
+    // even on a divisible trip, or copies 1..U-1 would use copy 0's index/value
+    // (e.g. `out[i]=i` would store i to out[i..i+U-1]). A strength-reduced GEMM
+    // never reads the counter in its body (addressing is via recurrence IVs, the
+    // counter lives only in the latch), so this stays false and the divisible
+    // fast path keeps skipping the (then-dead) offset.
+    bool bodyUsesCounter = false;
+    for (int i = 0; i < n - 3 && !bodyUsesCounter; ++i) {
+      const ir::Inst &in = b.insts[i];
+      const ir::Operand *s[3] = {&in.s1, &in.s2, &in.s3};
+      for (int k = 0; k < 3; ++k)
+        if (s[k]->kind == ir::Operand::Reg && s[k]->value == counter) {
+          bodyUsesCounter = true; break;
+        }
+    }
+
     std::vector<ir::Inst> out;
     for (int c = 0; c < U; ++c) {
       std::map<uint32_t, uint32_t> ren;
@@ -240,11 +262,14 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
         ren[*it] = fn.regs.nextVReg++;                 // fresh temp per copy.
 
       int pc = -1;
-      if (c > 0 && !divisible) {
-        // Non-divisible trip: each copy c>=1 needs its own counter value
-        // counter+c*step only to evaluate the remainder predicate p_c (which
-        // guards the copy's loads against an out-of-range K). On a divisible
-        // trip this is unnecessary, so skip the (dead) offset entirely.
+      if (c > 0 && (!divisible || bodyUsesCounter)) {
+        // Copy c gets its own counter value counter + c*step whenever either:
+        //   * the trip is non-divisible -- to evaluate the remainder predicate
+        //     p_c that guards this copy's loads against an out-of-range bound, OR
+        //   * the body reads the counter -- so this copy sees its own loop index
+        //     / stored value rather than copy 0's.
+        // A divisible trip whose body never touches the counter (a strength-
+        // reduced GEMM) skips this: the offset would be dead code.
         uint32_t cimm = fn.regs.nextVReg++;            // LOADI c*step
         uint32_t ivc  = fn.regs.nextVReg++;            // iv_c = counter + c*step
         ren[counter] = ivc;
@@ -255,12 +280,16 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
         ad.dst = ir::Operand::reg(ivc);
         ad.s1 = ir::Operand::reg(counter); ad.s2 = ir::Operand::reg(cimm);
         out.push_back(ad);
-        pc = remPred[c - 1];                           // p_c = G && (iv_c < bound)
-        ir::Inst cp = cmp;                             // same CMPP.lt.<type>, s2=bound
-        cp.dst = ir::Operand::pred((uint32_t)pc);
-        cp.s1 = ir::Operand::reg(ivc);
-        cp.guard = bodyGuard;
-        out.push_back(cp);
+        // Remainder predicate is only for the non-divisible tail; a divisible
+        // trip with a counter-reading body needs the offset but no guard.
+        if (!divisible) {
+          pc = remPred[c - 1];                         // p_c = G && (iv_c < bound)
+          ir::Inst cp = cmp;                           // same CMPP.lt.<type>, s2=bound
+          cp.dst = ir::Operand::pred((uint32_t)pc);
+          cp.s1 = ir::Operand::reg(ivc);
+          cp.guard = bodyGuard;
+          out.push_back(cp);
+        }
       }
       for (int i = 0; i < n - 3; ++i) {
         ir::Inst in = b.insts[i];
