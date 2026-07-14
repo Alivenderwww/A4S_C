@@ -100,12 +100,15 @@ def _run_one_task(task: dict) -> str:
         # across models by restarting it, but defensively we support either).
         backend = _make_backend(onnx_path, backend_name="cupy")
 
-        # Weight-streaming models (e.g. BigFormer 19GB > 17GB GPU): respect the
-        # requested batch size — the pool's freed weight blocks are not always
-        # reclaimed fast enough for larger batches to fit, so a conservative
-        # batch keeps memory bounded while still producing correct results.
+        # Weight-streaming models (e.g. BigFormer 19GB > 17GB GPU): the memory
+        # pool cannot reclaim freed weight blocks fast enough to also hold large
+        # per-batch activations, so cap the batch to keep peak memory < GPU free.
+        # Empirically batch=4 works for BigFormer (17GB GPU); batch=256 OOMs.
         streaming = getattr(getattr(backend, "rt", None), "streaming", False)
-        bs = max(1, batch_size)
+        if streaming:
+            bs = min(batch_size, 4)
+        else:
+            bs = max(1, batch_size)
         collected = {name: [] for name in backend.output_names}
         for start in range(0, n, bs):
             end = min(start + bs, n)
