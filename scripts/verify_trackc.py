@@ -216,10 +216,12 @@ def layer_a(zip_path: Path, rep: Reporter) -> None:
         else:
             rep.fail("C2/libaec.so 存在", lib)
 
-        dev = rp(tc.C2_DEVICE_LIB)
-        rep.add("C2/lib/libaec_device.so (依赖)", zv.exists_file(dev),
-                "WARN" if not zv.exists_file(dev) else "PASS",
-                "" if zv.exists_file(dev) else "libaec.so rpath 依赖缺失")
+        dev = rp(tc.C2_DEVICE_LIB_FORBIDDEN)
+        if zv.exists_file(dev):
+            rep.fail("C2/lib/libaec_device.so（禁止提交）",
+                     "设备库由评测框架在包外注入；提交中不得包含")
+        else:
+            rep.pass_("C2/lib/libaec_device.so（未提交）")
 
         dma = rp(tc.C2_DMA_AGENT)
         ker = rp(tc.C2_KERNEL_AGENT)
@@ -339,15 +341,28 @@ def layer_b(zip_path: Path, rep: Reporter, remote_public: str | None) -> None:
     rep.pass_("远端解压", roots[0])
 
     # unzip 已从 ZIP 中恢复 create_system=3 条目的 Unix 权限
-    # 对 .so 额外 chmod +x 以防 umask 过滤（dlopen 通常不需 x，保留防御）
+    # 对提交的 libaec.so 额外 chmod +x 以防 umask 过滤
     tc.remote_run(
         " ".join([
             "chmod", "+x",
             tc.shell_quote(root_remote + "/C2/libaec.so"),
-            tc.shell_quote(root_remote + "/C2/lib/libaec_device.so"),
             "2>/dev/null", ";", "true",
         ])
     )
+
+    # ---- 上传官方参考 libaec_device.so（包外提供，非提交内容） ----
+    official_dev = HERE.parent / "public" / "Track-C" / "C2-runtime" / "starter-kit" / "lib" / "libaec_device.so"
+    if not official_dev.exists():
+        rep.fail("C2 官方参考设备库",
+                 f"本地缺失 {official_dev}，请确认 public/Track-C/ 完整")
+        tc.remote_rmtree(remote_base)
+        return
+    r = tc.remote_push([official_dev], remote_base + "/official-reference/")
+    if r.returncode != 0:
+        rep.fail("上传官方设备库", r.stderr.strip() or f"exit={r.returncode}")
+        tc.remote_rmtree(remote_base)
+        return
+    official_dev_remote = f"{remote_base}/official-reference/libaec_device.so"
 
     # ---- C1 冒烟：build-on-first-use + selftest ----
     rep.add("== C1 运行时（compiler/aec-cc --selftest） ==", True, "INFO")
@@ -359,15 +374,17 @@ def layer_b(zip_path: Path, rep: Reporter, remote_public: str | None) -> None:
             "PASS" if r.returncode == 0 else "FAIL",
             (r.stdout.strip().splitlines()[-1] if r.stdout.strip() else f"exit={r.returncode}"))
 
-    # ---- C2 冒烟：libaec.so 可加载 ----
+    # ---- C2 冒烟：libaec.so 可加载（先 RTLD_GLOBAL 加载官方设备库） ----
     rep.add("== C2 运行时（libaec.so 加载） ==", True, "INFO")
     c2root = f"{root_remote}/C2"
     r = tc.remote_run(
-        f"python3 -c \"import ctypes,sys; ctypes.CDLL(sys.argv[1]); print('loaded')\" "
-        f"{tc.shell_quote(c2root + '/libaec.so')}",
+        f"python3 -c \"import ctypes,sys; "
+        f"ctypes.CDLL(sys.argv[1],mode=ctypes.RTLD_GLOBAL); "
+        f"ctypes.CDLL(sys.argv[2]); print('loaded')\" "
+        f"{tc.shell_quote(official_dev_remote)} {tc.shell_quote(c2root + '/libaec.so')}",
         capture=True, timeout=120,
     )
-    rep.add("C2 libaec.so dlopen", r.returncode == 0,
+    rep.add("C2 libaec.so dlopen（官方设备库 + RTLD_GLOBAL）", r.returncode == 0,
             "PASS" if r.returncode == 0 else "FAIL",
             (r.stdout.strip() or r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"exit={r.returncode}"))
 

@@ -38,7 +38,7 @@ C1_CPP_SRC = "C1/compiler/src/src"        # C++ 源码目录
 
 # C2
 C2_LIBAEC = "C2/libaec.so"                # Runtime 动态库（必需，固定路径）
-C2_DEVICE_LIB = "C2/lib/libaec_device.so"  # libaec.so 的运行时依赖（rpath=$ORIGIN/lib）
+C2_DEVICE_LIB_FORBIDDEN = "C2/lib/libaec_device.so"  # 禁止提交；评测框架在包外经 RTLD_GLOBAL 提供
 C2_AGENTS_DIR = "C2/agents"
 C2_DMA_AGENT = "C2/agents/dma_agent.py"   # 可选
 C2_KERNEL_AGENT = "C2/agents/kernel_agent.py"  # 可选

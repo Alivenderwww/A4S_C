@@ -16,9 +16,8 @@ EXAMPLES := \
 
 all: $(RUNTIME)
 
-$(RUNTIME): src/aec_runtime.cpp include/aec_runtime.h include/aec_device_abi.h include/aec_isa.h lib/libaec_device.so
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -shared $< -o $@ -Llib -laec_device -pthread \
-		-Wl,-rpath,'$$ORIGIN/lib'
+$(RUNTIME): src/aec_runtime.cpp include/aec_runtime.h include/aec_device_abi.h include/aec_isa.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -shared $< -o $@ -pthread
 
 bin/%: examples/%.c $(RUNTIME)
 	mkdir -p $(@D)

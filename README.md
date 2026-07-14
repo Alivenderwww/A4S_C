@@ -53,14 +53,14 @@ C3 算子调度 : ONNX 模型    ──►  AEC GPGPU 推理
 TrackC-<编号1姓名1>-<编号2姓名2>-<编号3姓名3>.zip
 └── TrackC-<编号1姓名1>-<编号2姓名2>-<编号3姓名3>/
     ├── C1/compiler/{aec-cc, src/{Makefile,src,include,tools}}   # 入口 wrapper + 源码文件夹
-    ├── C2/{libaec.so, lib/libaec_device.so, agents/}            # Runtime + 依赖 + 可选 Agent
+    ├── C2/{libaec.so, agents/}                                   # Runtime + 可选 Agent
     └── C3/{src/{scheduler,runtime,tools,benchmarks}, requirements.txt, readme.md}
 ```
 
 关键处理（开发仓库本身不动，全部发生在打包暂存副本里）：
 
 - **C1**：wrapper `compiler/aec-cc` 的 `root` 改写为 `./src`，源码收入 `compiler/src/`；评测机首次调用自动 `make build`（build-on-first-use）。
-- **C2**：`libaec.so` 缺失时**自动在 mig02 远程构建并回传**（仅传 KB 级源码 + 回传 .so）；`libaec_device.so` 作为 rpath 依赖一并附带（公共资产，原样）。
+- **C2**：`libaec.so` 缺失时**自动在 mig02 远程构建并回传**（仅传 KB 级源码 + 回传 .so）；`libaec_device.so` **不随提交打包**——评测框架在包外经 `RTLD_GLOBAL` 注入官方参考设备库。
 - **C3**：框架源码收入 `C3/src/`（Q&A 要求）；`README.md` → 小写 `readme.md`，命令为 `python src/tools/...`（评测以 `C3/` 为工作目录，脚本内部 `sys.path` 自注入 `src/` 使 `from scheduler import` 生效）。
 
 ### 前置条件
@@ -89,7 +89,7 @@ py -3.13 scripts/verify_trackc.py --zip TrackC-20260001张三-20260002李四-202
 | 层 | 触发 | 内容 |
 |----|------|------|
 | **Layer A**（静态，本地） | 默认即跑 | zip 命名 / 结构 / 路径 / 可执行位 / ELF magic / readme / 体积 / 洁净度，无需解压 |
-| **Layer B**（运行时，mig02） | `--remote` | 上传 zip → 解压 → C1 `aec-cc --selftest`（build-on-first-use）、C2 `dlopen libaec.so`、C3.1 `export_dag`（无公共模型时自动生成探针模型）、C3.5 worker `READY` |
+| **Layer B**（运行时，mig02） | `--remote` | 上传 zip → 解压 → C1 `aec-cc --selftest`（build-on-first-use）、C2 `RTLD_GLOBAL + dlopen libaec.so`（官方参考设备库包外注入）、C3.1 `export_dag`（无公共模型时自动生成探针模型）、C3.5 worker `READY` |
 
 任一硬性 FAIL 退出码非 0；Layer A 有硬性 FAIL 时自动跳过 Layer B。可选公共资产（官方 grader、onnx 模型）在 mig02 上缺失记为 WARN，不计入失败。
 

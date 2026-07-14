@@ -6,11 +6,12 @@
     TrackC-<m1>-<m2>-<m3>.zip
     └── TrackC-<m1>-<m2>-<m3>/
         ├── C1/compiler/{aec-cc, src/{Makefile,src,include,tools}}
-        ├── C2/{libaec.so, lib/libaec_device.so, agents/}
+        ├── C2/{libaec.so, agents/}
         └── C3/{scheduler,runtime,tools,benchmarks,requirements.txt,readme.md}
 
 C1 wrapper 的 root 路径在暂存副本里改写为 ./src（源码已收入 compiler/src/）。
 C2/libaec.so 缺失时默认走远程服务器（mig02）构建并回传。
+注意：libaec_device.so 不随提交打包；评测框架在包外经 RTLD_GLOBAL 提供。
 
 用法见 --help。仅依赖标准库，跨平台。
 """
@@ -114,19 +115,16 @@ def stage_c1(c1_src: Path, dst: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def stage_c2(c2_src: Path, dst: Path) -> None:
-    """C2 -> {libaec.so, lib/libaec_device.so, agents/}。"""
+    """C2 -> {libaec.so, agents/}。
+
+    注意：libaec_device.so / lib/ 不随提交打包。
+    """
     libaec = c2_src / "libaec.so"
     if not libaec.exists() or not tc.is_elf(libaec):
         raise FileNotFoundError(
             f"C2/libaec.so 缺失或非 ELF（{libaec}）。请先用 --build-c2 构建并回传。"
         )
     _copy_file(libaec, dst / "libaec.so")
-
-    devlib = c2_src / "lib" / "libaec_device.so"
-    if devlib.exists():
-        _copy_file(devlib, dst / "lib" / "libaec_device.so")
-    else:
-        print(f"[pack][C2] 警告：缺少设备库 {devlib}（libaec.so 的 rpath 依赖）", file=sys.stderr)
 
     agents = c2_src / "agents"
     if agents.is_dir():
@@ -171,9 +169,11 @@ def stage_c3(c3_src: Path, dst: Path) -> None:
 def build_c2_remote(c2_src: Path) -> None:
     """在 mig02 上构建 libaec.so 并回传到 C2/libaec.so。
 
-    流程：scp -r 推送构建输入（src/ include/ lib/ Makefile）到服务器临时目录 ->
+    流程：推送构建输入（Makefile src/ include/）到服务器临时目录 ->
     ssh make -> scp 回传 libaec.so -> 清理临时目录。
     仅传 KB 级源码 + 小体积 .so，流量极小。
+
+    注意：lib/（设备库）不随提交打包，构建时也不需上传。
     """
     print("[pack][C2] 远程构建 libaec.so ...", file=sys.stderr)
     ts = os.getpid()
@@ -181,7 +181,7 @@ def build_c2_remote(c2_src: Path) -> None:
     remote_c2 = f"{remote_base}/C2"
 
     inputs = []
-    for item in ("Makefile", "src", "include", "lib"):
+    for item in ("Makefile", "src", "include"):
         s = c2_src / item
         if s.exists():
             inputs.append(s)
