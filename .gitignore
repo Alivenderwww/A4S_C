@@ -11,3 +11,7 @@ __pycache__/
 
 # Orchestrator deepwork progress (local only)
 .slim/deepwork/
+
+# 提交打包产物（pack_trackc.py 生成；libaec.so 由脚本远程构建回传，zip 是提交压缩包）
+/TrackC-*.zip
+/C2/libaec.so

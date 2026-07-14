@@ -38,7 +38,73 @@ C3 算子调度 : ONNX 模型    ──►  AEC GPGPU 推理
 
 ## 远程执行工具
 
-远程执行相关内容（`scripts/remote_exec.py` 等）不在此文档中维护，请以项目内实际部署说明为准。
+`scripts/remote_exec.py` 在 mig02 服务器（Linux, gcc 13.3）上执行命令，供远程构建/测试使用。
+连接配置固定（`mig02@39.107.68.147:1102`，私钥 `./mig02`）；下方打包/校验脚本复用其配置。
+服务器公网流量有限——禁止经其上传/下载大文件、禁止隧道/端口转发。
+
+## 提交打包与校验（pack / verify）
+
+`scripts/pack_trackc.py` 与 `scripts/verify_trackc.py` 负责把 C1/C2/C3 装配成官方要求的提交压缩包并校验。
+仅依赖 Python 标准库，跨平台（在 Windows 开发机即可运行；`libaec.so` 构建与运行时校验在 mig02 上完成）。
+
+### 产出的提交结构
+
+```text
+TrackC-<编号1姓名1>-<编号2姓名2>-<编号3姓名3>.zip
+└── TrackC-<编号1姓名1>-<编号2姓名2>-<编号3姓名3>/
+    ├── C1/compiler/{aec-cc, src/{Makefile,src,include,tools}}   # 入口 wrapper + 源码文件夹
+    ├── C2/{libaec.so, lib/libaec_device.so, agents/}            # Runtime + 依赖 + 可选 Agent
+    └── C3/{src/{scheduler,runtime,tools,benchmarks}, requirements.txt, readme.md}
+```
+
+关键处理（开发仓库本身不动，全部发生在打包暂存副本里）：
+
+- **C1**：wrapper `compiler/aec-cc` 的 `root` 改写为 `./src`，源码收入 `compiler/src/`；评测机首次调用自动 `make build`（build-on-first-use）。
+- **C2**：`libaec.so` 缺失时**自动在 mig02 远程构建并回传**（仅传 KB 级源码 + 回传 .so）；`libaec_device.so` 作为 rpath 依赖一并附带（公共资产，原样）。
+- **C3**：框架源码收入 `C3/src/`（Q&A 要求）；`README.md` → 小写 `readme.md`，命令为 `python src/tools/...`（评测以 `C3/` 为工作目录，脚本内部 `sys.path` 自注入 `src/` 使 `from scheduler import` 生效）。
+
+### 前置条件
+
+- 私钥 `./mig02` 就绪（远程构建 `libaec.so` 与 `--remote` 校验都需要；`remote_exec.py` 会自动从 `~/.ssh/mig02` 复制并 `chmod 600`）。
+- 本机有 `ssh`（Windows 用 OpenSSH 或 msys2 的 ssh 均可；脚本经 tar/ssh 管道传文件，不依赖 scp）。
+
+### 快速开始
+
+```bash
+# 1) 打包（默认占位成员；libaec.so 缺失会自动远程构建）
+py -3.13 scripts/pack_trackc.py
+
+# 2) 真实成员信息打包
+py -3.13 scripts/pack_trackc.py --members "20260001张三,20260002李四,20260003王五"
+
+# 3) 静态校验（本地、快、无网络）
+py -3.13 scripts/verify_trackc.py --zip TrackC-20260001张三-20260002李四-20260003王五.zip
+
+# 4) 完整校验：静态 + 远程 Linux 运行时（与评测同构，正式提交前必跑一次）
+py -3.13 scripts/verify_trackc.py --zip TrackC-20260001张三-20260002李四-20260003王五.zip --remote
+```
+
+### 两层校验
+
+| 层 | 触发 | 内容 |
+|----|------|------|
+| **Layer A**（静态，本地） | 默认即跑 | zip 命名 / 结构 / 路径 / 可执行位 / ELF magic / readme / 体积 / 洁净度，无需解压 |
+| **Layer B**（运行时，mig02） | `--remote` | 上传 zip → 解压 → C1 `aec-cc --selftest`（build-on-first-use）、C2 `dlopen libaec.so`、C3.1 `export_dag`（无公共模型时自动生成探针模型）、C3.5 worker `READY` |
+
+任一硬性 FAIL 退出码非 0；Layer A 有硬性 FAIL 时自动跳过 Layer B。可选公共资产（官方 grader、onnx 模型）在 mig02 上缺失记为 WARN，不计入失败。
+
+### 常用参数
+
+| 脚本 | 参数 | 说明 |
+|------|------|------|
+| pack | `--members` | 三位成员 `编号1姓名1,编号2姓名2,编号3姓名3`（默认占位 `00000000成员1,...`） |
+| pack | `--out` | 输出目录（默认仓库根） |
+| pack | `--build-c2 {auto,remote,wsl,none}` | `libaec.so` 构建方式（默认 `auto`：先 remote 再 wsl） |
+| verify | `--zip` | 待校验 zip（缺省自动找仓库内最新 `TrackC-*.zip`） |
+| verify | `--remote` | 追加 Layer B 远程运行时校验 |
+| verify | `--remote-public` | 服务器公共资料路径（默认 `~/A4S/public`） |
+
+> 备注：远程构建回传的 `C2/libaec.so` 是构建产物，落在工作区——是否提交请按本地策略（如需忽略可加入 `.gitignore`）。GitHub Private Repo 上传与赛道邮箱（`zdhuang24@m.fudan.edu.cn`）提交为后续手动步骤，脚本只负责产出并验证合规 zip。
 
 ## C1 状态快照
 
