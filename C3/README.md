@@ -79,23 +79,30 @@ python tools/export_dag.py \
   --output dag_mlp.json
 ```
 
-### C3.5 端到端推理
+### C3.5 端到端推理（持久化 Worker 协议）
+
+> **2026-07-14 更新**：C3.5 评测改为**持久化 worker** 协议（见
+> `C35_WORKER_PROTOCOL.md`）。评测机以启动命令启动 worker（不带任务参数），
+> 经 stdin 下发 JSON 任务，worker 经 stdout 回 JSON 结果。计时只覆盖
+> "加载模型 + 推理 + 写输出"，不含进程启动与框架初始化。
+
+**提交的 worker 启动命令**（报名时提交，不带任务参数）：
+
+```bash
+python tools/infer_worker.py
+```
+
+worker 启动后：
+1. 一次性导入 CuPy / 初始化 CUDA context（不计入计时），向 stdout 输出 `READY`。
+2. 循环读 stdin 的 JSON 任务：`{"onnx":"...","input":"...","output":"...","batch_size":256}`，
+   加载模型 + 分批推理 + 写输出，回 stdout 一行 `{"status":"ok","samples":N}`。
+3. 收到 `{"cmd":"exit"}` 干净退出（退出码 0）。
+4. stdout 仅输出 `READY` 与结果行；所有日志走 stderr。
+
+`tools/infer.py` 保留作为**一次性 CLI**（C3.1 自测 / 兼容旧调用），同样可用：
 
 ```bash
 python tools/infer.py --onnx {onnx} --input {input} --output {output} --batch-size 256
-```
-
-- `{input}` 目录含 `manifest.json` + `.npy`；`{output}` 目录写出同结构 `manifest.json`
-  + `logits.npy`（float32，行序与输入一致）。
-- `--batch-size` 分批推理，同时压低峰值显存（显存是排名项）。
-
-示例：
-
-```bash
-python tools/infer.py \
-  --onnx  .../models/resnet_v1.onnx \
-  --input .../testdata/c35/resnet_v1/input \
-  --output out_resnet --batch-size 256
 ```
 
 ---
@@ -105,6 +112,10 @@ python tools/infer.py \
 ```bash
 # C3.1 + C3.5：三模型 DAG 结构校验 + 精度/准确率门槛（allclose 1e-3）
 python tests/selftest_c31_c35.py
+
+# C3.5 worker 协议自测（stdin 发任务，stdout 收 READY+结果）
+echo '{"onnx":"resnet_v1.onnx","input":"testdata_resnet/input","output":"out_rn","batch_size":256}
+{"cmd":"exit"}' | python tools/infer_worker.py
 
 # C3.2 + C3.3：本地自评分（D1–D5 / F1–F4）
 python benchmarks/c32_c33/bench_c32_c33.py \
@@ -203,10 +214,15 @@ A–E 每项的命中证据写进 `plan.summary['c3d_evidence']` 供 code review
 > 替换 `DeviceMemoryPool._backend` 为 `cudaMalloc/cudaMemcpyAsync` 即可对接真实设备。
 
 ### C3.5 典型模型部署（50）— ✅ 已实现（正确性优先）
-- onnxruntime（CUDA→CPU EP）→ `onnx.reference` 三级回退；fp32 保证过 1e-3 门槛；
-  `--batch-size` 分批控显存。三模型精度/准确率均达标。
-- **TODO（冲运行时间/显存排名）**：低精度（fp16/TF32）加速 + 逐模型验证精度不越界；
-  IOBinding / 预分配输出、CUDA Graph、算子融合导出等。
+### C3.5 典型模型部署（50）— ✅ 持久化 Worker 已实现（正确性优先）
+- **评测协议**：`tools/infer_worker.py` 实现持久化 worker（`C35_WORKER_PROTOCOL.md`）：
+  启动→`READY`→stdin 读 JSON 任务→推理写盘→stdout 回 `{"status":"ok","samples":N}`→`{"cmd":"exit"}` 退出。
+  stdout 仅协议信号，日志走 stderr。CuPy 一次性初始化（不计入计时）。
+- **推理核心**：CuPy GPU 后端（手写算子），fp32 保证过 1e-3 门槛；`--batch-size` 分批控显存。
+  三模型（MLP/ResNet/Transformer）精度/准确率均达标。
+- **性能项**（ResNet 25+10 分排名）：运行时间与峰值显存由 worker 协议采样（2 warmup + 5 计时取中位数/最大值）。
+- **TODO（冲排名/支持 BigFormer）**：① BigFormer 18GB 权重需分块上载（超 16GB 显存）；
+  ② 低精度加速 + IOBinding/CUDA Graph。
 
 ---
 
