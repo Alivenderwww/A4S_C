@@ -18,6 +18,7 @@
 // accumulator update happens. On at -O2. GEMM K-loop 5240->2168 (-59%).
 #include "aec/passes.h"
 
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <vector>
@@ -219,6 +220,19 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
             if (s[k]->kind == ir::Operand::Reg && s[k]->value == counter) usesCounter = true;
         }
 
+        // Unit-stride address IVs (constant stride == the 4-byte f32 element):
+        // their per-copy loads land at adjacent addresses, so a consecutive
+        // copy pair can share one LD.b64 -- the even copy loads both elements
+        // (low + high f32), the odd copy drops its load and reads the pinned
+        // high half. Halves those loads' 128B-line memory requests.
+        std::set<uint32_t> unitStrideIV;
+        for (unsigned a = 0; a < addrIV.size(); ++a) {
+          uint32_t sv = 0;
+          if (constOf(fn, addrStride[a], sv) && sv == 4) unitStrideIV.insert(addrIV[a]);
+        }
+        const bool coalesceLoads = std::getenv("AEC_NO_MEM_COALESCE") == 0;
+        std::map<uint32_t, uint32_t> pendingLo;   // body load-dst -> even copy's lo vreg
+
         // MAIN body: U copies, shared IVs advanced between copies, no predicate.
         std::vector<ir::Inst> mainI;
         for (int c = 0; c < U; ++c) {
@@ -240,8 +254,37 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
             ir::Inst in = body[i];
             if (in.op == ir::Op::ADD && in.dst.kind == ir::Operand::Reg &&
                 ivSet.count(in.dst.value)) continue;           // drop IV self-increment
+
+            // Pair adjacent f32 loads from consecutive unrolled copies.  The
+            // address recurrence is advanced by exactly four bytes after each
+            // copy, so copy 2k's LD.b64 reads both copy 2k and copy 2k+1.  Keep
+            // the odd copy's destination vreg as an explicit high-half alias;
+            // the scheduler and allocator consume loadPairHi to preserve the
+            // RAW edge and pin it to low+1 respectively.
+            const uint32_t bodyDst = in.dst.kind == ir::Operand::Reg
+                                         ? in.dst.value : 0;
+            const bool pairableLoad =
+                coalesceLoads && c + (c & 1 ? 0 : 1) < U &&
+                in.op == ir::Op::LD && in.type == ir::Type::F32 &&
+                in.dst.kind == ir::Operand::Reg &&
+                in.s1.kind == ir::Operand::Reg &&
+                unitStrideIV.count(in.s1.value);
             renameOperand(in.dst, ren); renameOperand(in.s1, ren);
             renameOperand(in.s2, ren); renameOperand(in.s3, ren);
+
+            if (pairableLoad) {
+              if ((c & 1) == 0) {
+                in.type = ir::Type::B64;
+                pendingLo[bodyDst] = in.dst.value;
+              } else {
+                std::map<uint32_t, uint32_t>::iterator lo = pendingLo.find(bodyDst);
+                if (lo != pendingLo.end()) {
+                  fn.regs.loadPairHi[lo->second] = in.dst.value;
+                  pendingLo.erase(lo);
+                  continue;                                  // high half already loaded.
+                }
+              }
+            }
             mainI.push_back(in);
           }
           for (unsigned a = 0; a < addrIV.size(); ++a) {       // inter-copy IV advance

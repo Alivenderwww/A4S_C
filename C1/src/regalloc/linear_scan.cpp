@@ -117,7 +117,16 @@ void linearScan(ir::Function &fn, const Options & /*opt*/) {
       instRegs(blk.insts[i], uses, def);
       for (unsigned k = 0; k < uses.size(); ++k)
         if (!defined.count(uses[k])) useB[b].insert(uses[k]); // upward exposed
-      if (def >= 0) { defined.insert((uint32_t)def); defB[b].insert((uint32_t)def); }
+      if (def >= 0) {
+        defined.insert((uint32_t)def); defB[b].insert((uint32_t)def);
+        // A coalesced LD.b64 also defines its pinned high half (else that half
+        // reads as an undefined, function-wide-live vreg).
+        std::map<uint32_t, uint32_t>::const_iterator h =
+            fn.regs.loadPairHi.find((uint32_t)def);
+        if (h != fn.regs.loadPairHi.end()) {
+          defined.insert(h->second); defB[b].insert(h->second);
+        }
+      }
     }
   }
 
@@ -165,8 +174,27 @@ void linearScan(ir::Function &fn, const Options & /*opt*/) {
       std::vector<uint32_t> uses; int def;
       instRegs(fn.blocks[b].insts[i], uses, def);
       for (unsigned k = 0; k < uses.size(); ++k) Ext::go(iv, uses[k], p);
-      if (def >= 0) Ext::go(iv, (uint32_t)def, p);
+      if (def >= 0) {
+        Ext::go(iv, (uint32_t)def, p);
+        std::map<uint32_t, uint32_t>::const_iterator h =
+            fn.regs.loadPairHi.find((uint32_t)def);
+        if (h != fn.regs.loadPairHi.end()) Ext::go(iv, h->second, p);
+      }
     }
+  }
+
+  // Coalesced-load high halves are not allocated independently: fold each into
+  // its low half's interval (so the pair register stays reserved until both are
+  // dead) and drop it -- it is pinned to lo's register + 1 after the scan.
+  for (std::map<uint32_t, uint32_t>::const_iterator it = fn.regs.loadPairHi.begin();
+       it != fn.regs.loadPairHi.end(); ++it) {
+    std::map<uint32_t, Interval>::iterator loI = iv.find(it->first);
+    std::map<uint32_t, Interval>::iterator hiI = iv.find(it->second);
+    if (loI != iv.end() && hiI != iv.end()) {
+      if (hiI->second.start < loI->second.start) loI->second.start = hiI->second.start;
+      if (hiI->second.end   > loI->second.end)   loI->second.end   = hiI->second.end;
+    }
+    if (hiI != iv.end()) iv.erase(hiI);
   }
 
   std::vector<Interval> ivs;
@@ -185,6 +213,17 @@ void linearScan(ir::Function &fn, const Options & /*opt*/) {
     for (unsigned i = 0; i < fn.blocks[b].insts.size(); ++i) {
       const ir::Inst &in = fn.blocks[b].insts[i];
       if (in.type != ir::Type::B64 && in.type != ir::Type::F64) continue;
+      // A wide memory access does not make its ADDRESS a pair.  LD writes a
+      // pair destination; ST reads a pair value from s2.  Other wide ops use
+      // the ordinary rule that all register operands carry the wide value.
+      if (in.op == ir::Op::LD || in.op == ir::Op::LDC) {
+        if (in.dst.kind == ir::Operand::Reg) wide.insert(in.dst.value);
+        continue;
+      }
+      if (in.op == ir::Op::ST) {
+        if (in.s2.kind == ir::Operand::Reg) wide.insert(in.s2.value);
+        continue;
+      }
       if (in.dst.kind == ir::Operand::Reg) wide.insert(in.dst.value);
       const ir::Operand *s[3] = {&in.s1, &in.s2, &in.s3};
       for (int k = 0; k < 3; ++k)
@@ -276,6 +315,14 @@ void linearScan(ir::Function &fn, const Options & /*opt*/) {
   }
   spillCount += (uint32_t)spilled.size();
   if (!spilled.empty()) maxPhys = kRegisterCount - 1;   // scratch band in use.
+
+  // Pin each coalesced high half to its low half's pair register + 1: the
+  // LD.b64 wrote the low f32 into R and the high f32 into R+1.
+  for (std::map<uint32_t, uint32_t>::const_iterator it = fn.regs.loadPairHi.begin();
+       it != fn.regs.loadPairHi.end(); ++it) {
+    std::map<uint32_t, int>::iterator lp = physOf.find(it->first);
+    if (lp != physOf.end() && lp->second >= 0) physOf[it->second] = lp->second + 1;
+  }
 
   // --- 6. Rewrite Reg operands to physical registers, materializing spills. -
   // Fast path (no spill): rewrite in place, byte-identical to the old scan.

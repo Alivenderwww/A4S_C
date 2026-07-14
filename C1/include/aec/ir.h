@@ -8,6 +8,7 @@
 #define AEC_IR_H
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,13 @@ struct RegInfo {
   uint32_t nextPred = 0;          // P0..P7.
   uint32_t maxPhys  = 0;          // highest physical reg assigned (diagnostic).
   uint32_t spillCount = 0;        // spill slots emitted (diagnostic).
+
+  // Coalesced-load pairs: a `LD.b64` writes the low f32 into its dst pair base
+  // R and the high f32 into R+1. The dst vreg (b64, so pair-allocated) is the
+  // LOW half; `loadPairHi[lo] = hi` names the vreg the register allocator must
+  // pin to R+1 so a second consumer reads the high f32 with no extra
+  // instruction. Populated by the unroller's b64 load coalescing.
+  std::map<uint32_t, uint32_t> loadPairHi;
 };
 
 struct Param {

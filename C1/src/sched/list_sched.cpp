@@ -100,6 +100,11 @@ void listSchedule(ir::Function &fn, const Options &opt) {
     for (int i = 0; i < N; ++i) {
       std::vector<uint32_t> uses, defs;
       defUse(b.insts[i], uses, defs);
+      if (b.insts[i].dst.kind == ir::Operand::Reg) {
+        std::map<uint32_t, uint32_t>::const_iterator hi =
+            fn.regs.loadPairHi.find(b.insts[i].dst.value);
+        if (hi != fn.regs.loadPairHi.end()) defs.push_back(hi->second);
+      }
 
       for (size_t u = 0; u < uses.size(); ++u) {                 // RAW
         std::map<uint32_t, int>::iterator w = lastWriter.find(uses[u]);

@@ -129,7 +129,7 @@ uint32_t blockTrip(const ir::Function &fn, const ir::BasicBlock &b, unsigned bi)
 
 // Latency-aware makespan of one block: max of the dependency critical path
 // (scoreboard) and a 2-wide dual-issue bound.
-uint64_t blockMakespan(const ir::BasicBlock &b) {
+uint64_t blockMakespan(const ir::BasicBlock &b, const ir::RegInfo &regs) {
   const uint32_t PRED_NS = 0x10000u;
   std::map<uint32_t, int> ready;   // reg / predicate -> cycle result available
   int critical = 0;
@@ -147,7 +147,12 @@ uint64_t blockMakespan(const ir::BasicBlock &b) {
       if (it != ready.end()) t = std::max(t, it->second);
     }
     int done = t + estLatency(in);
-    if (in.dst.kind == ir::Operand::Reg) ready[in.dst.value] = done;
+    if (in.dst.kind == ir::Operand::Reg) {
+      ready[in.dst.value] = done;
+      std::map<uint32_t, uint32_t>::const_iterator hi =
+          regs.loadPairHi.find(in.dst.value);
+      if (hi != regs.loadPairHi.end()) ready[hi->second] = done;
+    }
     else if (in.dst.kind == ir::Operand::Pred)
       ready[PRED_NS | (in.dst.value & 0x7)] = done;
     critical = std::max(critical, done);
@@ -182,7 +187,7 @@ uint64_t estimateCyclesIR(const ir::Function &fn) {
     }
   uint64_t total = 0;
   for (unsigned bi = 0; bi < nb; ++bi)
-    total += blockMakespan(fn.blocks[bi]) * mult[bi];
+    total += blockMakespan(fn.blocks[bi], fn.regs) * mult[bi];
   return total;
 }
 
