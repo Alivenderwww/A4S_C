@@ -51,6 +51,7 @@ class CupyRuntime:
             raise RuntimeError("CuPy is not available; cannot use CupyRuntime")
         self.graph = graph
         self._topo = graph.topo_order()
+        self._fuse_gelu()
         self.streaming = streaming
         # Host-side weight store (numpy); used directly in streaming mode, and
         # as the upload source in eager mode.
@@ -96,6 +97,50 @@ class CupyRuntime:
                 if t and t not in self._init_host:
                     self._act_last_use[t] = i
         self._output_names = {t.name for t in graph.outputs}
+
+    def _fuse_gelu(self):
+        """Fuse the ONNX exact-GELU chain Div(h, sqrt2) -> Erf -> Add(., 1) ->
+        Mul(., h) -> Mul(., 0.5) into one FusedGelu node: one kernel and one
+        intermediate instead of five full-size ([., ., 4d]) ones. Anchored on the
+        (GELU-unique) Erf; requires each step to have a single consumer and the
+        trailing Mul to reuse the SAME h the Div divided -- the GELU signature --
+        so anything else is left untouched. The 1e-3 gate validates the result."""
+        prod = {o: n for n in self._topo for o in n.outputs}
+        cons: Dict[str, list] = {}
+        for n in self._topo:
+            for i in n.inputs:
+                cons.setdefault(i, []).append(n)
+
+        def only(t):
+            c = cons.get(t, [])
+            return c[0] if len(c) == 1 else None
+
+        fused: Dict[int, Node] = {}
+        drop = set()
+        for erf in self._topo:
+            if erf.op_type != "Erf":
+                continue
+            d = prod.get(erf.inputs[0])
+            if d is None or d.op_type != "Div" or not d.inputs:
+                continue
+            h = d.inputs[0]
+            a = only(erf.outputs[0])
+            if a is None or a.op_type != "Add":
+                continue
+            m1 = only(a.outputs[0])
+            if m1 is None or m1.op_type != "Mul" or h not in m1.inputs:
+                continue
+            m2 = only(m1.outputs[0])
+            if m2 is None or m2.op_type != "Mul":
+                continue
+            fused[id(erf)] = Node(name="FusedGelu_" + (erf.name or ""),
+                                  op_type="FusedGelu", inputs=[h],
+                                  outputs=[m2.outputs[0]])
+            drop.update(id(n) for n in (d, erf, a, m1, m2))
+        if not fused:
+            return
+        self._topo = [fused[id(n)] if id(n) in fused else n
+                      for n in self._topo if id(n) in fused or id(n) not in drop]
 
     def _compute_last_use(self) -> Dict[str, int]:
         """tensor name -> index in topo order of its last consuming node.

@@ -130,6 +130,19 @@ def op_Erf(x, **_):
     return erf(x).astype(x.dtype)
 
 
+# Exact GELU 0.5*h*(1+erf(h/sqrt2)) in ONE fused kernel. The ONNX graph decomposes
+# it into Div->Erf->Add->Mul->Mul (5 nodes, 5 full-size intermediates); the runtime
+# fuses that chain (cupy_runtime._fuse_gelu) into this single op -> one launch, one
+# read/write of the [.,.,4d] FFN tensor instead of five. Same fp32 math.
+_gelu_kernel = cp.ElementwiseKernel(
+    "float32 h", "float32 y",
+    "y = 0.5f * h * (1.0f + erff(h * 0.7071067811865476f));", "fused_gelu")
+
+
+def op_FusedGelu(h, **_):
+    return _gelu_kernel(h)
+
+
 def op_Sqrt(x, **_):
     return cp.sqrt(x)
 
