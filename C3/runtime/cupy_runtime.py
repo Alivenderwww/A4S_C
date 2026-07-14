@@ -279,32 +279,69 @@ class CupyRuntime:
         # seed external inputs (upload this batch)
         for name, val in feeds.items():
             env[name] = cp.asarray(np.asarray(val))
+        return self._run_streaming(env) if self.streaming else self._run_eager(env)
 
-        uploads, frees = self._uploads_before, self._frees_after
+    def _run_eager(self, env: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        frees = self._frees_after
         for i, node in enumerate(self._topo):
-            # A/D: bring in the float weights this node is the first to consume.
-            if self.streaming:
-                for w in uploads.get(i, ()):
-                    self._upload_weight(w, env)
             self._exec_node(node, env)
-            # B/C: release everything the plan says dies at this step -- dead
-            # intermediates (activation-lifetime reuse) and, in streaming mode,
-            # weights past their last use. Freeing a weight then forces the pool
-            # to return the block to the allocator: a bare del only drops the
-            # Python ref while the pool keeps the block cached, so streamed
-            # weights would otherwise accumulate across layers and OOM.
-            freed_weight = False
-            for t in frees.get(i, ()):
-                v = env.pop(t, None)
-                if (v is not None and not isinstance(v, np.ndarray)
-                        and hasattr(v, "ndim") and t in self._init_host):
-                    freed_weight = True
-            if freed_weight:
-                try:
-                    cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
+            for t in frees.get(i, ()):                    # drop dead intermediates
+                env.pop(t, None)
+        return self._collect_outputs(env)
 
+    def _run_streaming(self, env: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        """Streaming with H2D/compute overlap: a copy stream prefetches a node's
+        float weights while earlier nodes compute on the main stream, so the
+        ~19 GB weight upload (host->device, on PCIe) hides behind the matmul
+        compute (HBM+SM) -- measured near-full overlap.
+
+        Two event chains keep it correct despite the shared pool:
+          * the MAIN stream waits for a node's weight-upload event before running
+            it (weights ready before the kernel reads them);
+          * the COPY stream waits for the main stream's most recent compute before
+            uploading, so it never overwrites a pool block a still-running kernel
+            is reading (the free race). Transformer layers share weight shapes, so
+            freed blocks are reused in place and peak weight memory stays at
+            ~prefetch-depth layers -- no per-step free_all_blocks needed.
+        """
+        uploads, frees = self._uploads_before, self._frees_after
+        n = len(self._topo)
+        if not hasattr(self, "_copy_stream"):
+            self._copy_stream = cp.cuda.Stream(non_blocking=True)
+        cs = self._copy_stream
+        main = cp.cuda.get_current_stream()
+        D = 8                                     # nodes of prefetch look-ahead
+        up_evt: Dict[int, Any] = {}
+        last_cmp = [None]
+
+        def prefetch(k):
+            if k >= n:
+                return
+            ws = [w for w in uploads.get(k, ()) if w not in env]
+            if not ws:
+                return
+            if last_cmp[0] is not None:
+                cs.wait_event(last_cmp[0])        # don't reuse a block a kernel still reads
+            with cs:
+                for w in ws:
+                    self._upload_weight(w, env)
+            up_evt[k] = cs.record()
+
+        for k in range(D + 1):
+            prefetch(k)
+        for i, node in enumerate(self._topo):
+            evt = up_evt.pop(i, None)
+            if evt is not None:
+                main.wait_event(evt)              # this node's weights are ready
+            prefetch(i + D + 1)                   # keep the copy stream D nodes ahead
+            self._exec_node(node, env)
+            last_cmp[0] = main.record()
+            for t in frees.get(i, ()):
+                env.pop(t, None)
+        main.synchronize()
+        return self._collect_outputs(env)
+
+    def _collect_outputs(self, env: Dict[str, Any]) -> Dict[str, np.ndarray]:
         out: Dict[str, np.ndarray] = {}
         for t in self.graph.outputs:
             v = env.get(t.name)
