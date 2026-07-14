@@ -62,6 +62,15 @@ _F32_ONE = _np.array(1.0, dtype=_np.float32)
 _F32_ZERO = _np.array(0.0, dtype=_np.float32)
 _TC_MIN_ELEMS = 4096 * 64            # below this the fp16 cast overhead isn't worth it
 
+# Measured MIG-slice roofline (see [[c35-tensor-core-and-bigformer-opt]]): fp32
+# CUDA cores ~4.8 TFLOP/s, split-fp16 tensor-core effective ~22 TFLOP/s (3-term,
+# fp32-accurate), HBM ~339 GB/s. Used to decide when a conv's im2col GEMM is
+# worth running on tensor cores (which needs the batched im2col transposed to 2D
+# and back — see _conv_tc_wins).
+_FP32_FLOPS = 4.8e12
+_TC_FLOPS_EFF = 22.0e12
+_HBM_BW = 339e9
+
 # Split fp32 -> (hi, lo) fp16 in ONE pass (one launch, one read of x) instead of
 # the 3 astype passes; produces bit-identical hi/lo and is ~3.7x faster (the cast
 # was ~1/4 of the split-fp16 matmul time).
@@ -102,6 +111,24 @@ def _matmul_tc(a, b):
 
 def op_MatMul(a, b, **_):
     return _matmul_tc(a, b)
+
+
+def _conv_tc_wins(oc, K, n, P):
+    """True when a conv's im2col GEMM ``(oc,K) @ (K,n*P)`` is faster on tensor
+    cores than the fp32 batched GEMM, INCLUDING the two transposes the TC path
+    needs (batched im2col ``(n,K,P)`` -> 2D ``(K,n*P)`` and the result back).
+
+    The transpose traffic scales with the im2col size, so TC only wins for deep
+    layers (large channels, small spatial): e.g. on ResNet-18/CIFAR, layer4
+    (512ch, 4x4) is ~3.6x faster on TC while layer1 (64ch, 32x32) is slower.
+    Derived from the measured roofline, so it adapts to any conv shape (incl.
+    hidden ResNet variants) rather than hard-coding which layers use TC."""
+    if oc * K < _TC_MIN_ELEMS:                    # GEMM too small for fp16 cast to pay
+        return False
+    flops = 2.0 * oc * K * n * P
+    gemm_saving = flops / _FP32_FLOPS - flops / _TC_FLOPS_EFF
+    xpose = (n * K * P + n * oc * P) * 4 * 2 / _HBM_BW   # cols in + result out, r+w
+    return gemm_saving > xpose
 
 
 def op_Relu(x, **_):
@@ -262,9 +289,19 @@ def op_Conv(x, w, b=None, strides=None, pads=None, dilations=None,
     if group == 1:
         cols = _im2col(xp, kh, kw, sh, sw, dh, dw, oh, ow)   # (n, c*kh*kw, oh*ow)
         wcol = cp.reshape(w, (oc, -1))                        # (oc, c*kh*kw)
-        # batched GEMM via cuBLAS: (1,oc,K) @ (n,K,P) -> (n,oc,P).
-        out = cp.matmul(wcol[None], cols)
-        out = cp.reshape(out, (n, oc, oh, ow))
+        nn, K, P = cols.shape
+        if _conv_tc_wins(oc, K, nn, P):
+            # Tensor-core path: fold the batch into one 2D GEMM (oc,K)@(K,n*P) so
+            # the split-fp16 fp32-accurate matmul applies. The transpose in/out is
+            # cheap here precisely because _conv_tc_wins only fires when spatial P
+            # is small (deep ResNet layers) -- see its roofline test.
+            cols2 = cols.transpose(1, 0, 2).reshape(K, nn * P)
+            out2 = _matmul_tc(wcol, cols2)                    # (oc, n*P) fp32-accurate
+            out = out2.reshape(oc, nn, P).transpose(1, 0, 2).reshape(n, oc, oh, ow)
+        else:
+            # batched GEMM via cuBLAS: (1,oc,K) @ (n,K,P) -> (n,oc,P).
+            out = cp.matmul(wcol[None], cols)
+            out = cp.reshape(out, (n, oc, oh, ow))
     else:
         outs = []
         cg_in = c // group
