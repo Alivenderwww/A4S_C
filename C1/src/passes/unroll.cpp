@@ -150,16 +150,18 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     uint32_t boundConst = 0;
     const bool divisible = constOf(fn, boundReg, boundConst) && boundConst != 0 &&
                            (boundConst % (step * (uint32_t)U)) == 0;
-    // When the loop has strength-reduced address-recurrence IVs, each unrolled
-    // copy must carry an inter-copy `addr += stride` advance (correct, cheap),
-    // BUT a non-divisible trip ALSO forces a per-copy remainder-predicate
-    // (CMPP + counter offset) to guard the loads -- that overhead outweighs the
-    // loop-control savings and makes the unrolled body SLOWER than the original
-    // for a runtime trip like GEMM's K param. So only unroll an address-IV loop
-    // when the trip is provably divisible (constant bound, U | trip); for a
-    // runtime-bound address-IV loop, leave the strength-reduced single-iteration
-    // body intact (it is already tight). Skip = no change, always safe.
-    if (!addrIV.empty() && !divisible) continue;
+    // A strength-reduced address-IV loop with a RUNTIME trip (e.g. GEMM's K)
+    // still unrolls -- the point is LATENCY HIDING, not loop-control savings.
+    // The single-iteration body issues a load and immediately consumes it, so
+    // the consumer stalls the full memory latency every iteration; unrolling
+    // puts U independent load->use chains in flight at once (<=16 outstanding),
+    // overlapping those latencies. The per-copy remainder predicate (CMPP +
+    // counter offset) that guards out-of-range copies costs a few instructions
+    // but is dwarfed by the hidden latency. The register-pressure guard below
+    // still refuses to unroll into a spill, and real GPR spill (linear_scan)
+    // now makes any residual pressure correct rather than a clobber -- so the
+    // earlier reasons for skipping this case (remainder overhead dominates,
+    // spilling unsafe) no longer hold.
 
     // Loop-carried set (kept shared across copies); the counter is shifted.
     std::set<uint32_t> carried;
@@ -186,6 +188,115 @@ bool unrollLoops(ir::Function &fn, const Options &opt) {
     const size_t estRegs =
         carried.size() + steadyDefs.size() * (size_t)U + 2u * (size_t)(U - 1);
     if (estRegs > (size_t)(kRegisterCount * 3 / 4)) continue;   // ~192 of 256
+
+    // ---- Split path: unrolled main loop + scalar remainder ----------------
+    // For a strength-reduced address-IV loop with a RUNTIME trip, run
+    // floor(trip / U) FULL groups in an unrolled MAIN loop with NO per-copy
+    // remainder predicate (pure latency hiding, tightest body), then let the
+    // original single-iteration loop `b` run the <U leftover iterations as a
+    // scalar REMAINDER. Full groups carry no predicate overhead, so the dynamic
+    // instruction count does not grow the way a predicated-remainder unroll's
+    // does, while U independent load->use chains still overlap the memory
+    // latency. Blocks inserted before the loop; preheader/`b`/EXIT untouched:
+    //   preheader:   ... ; BRX Pg -> EXIT               (loop_rotate zero-trip guard)
+    //   main-guard:  kmain = bound & ~(U*step-1) ; BRX (counter>=kmain) -> b
+    //   main:        U copies ; counter += U*step ; BRX (counter<kmain) -> main
+    //   rem-guard:   BRX (counter>=bound) -> EXIT
+    //   b:           ...body... ; counter += step ; BRX (counter<bound) -> b   (remainder)
+    // Requires a power-of-two group stride (kmain via a cheap AND) and a
+    // preheader ending in the loop_rotate `BRX Pg -> EXIT` guard (names EXIT).
+    if (!addrIV.empty() && !divisible) {
+      const uint32_t grp = step * (uint32_t)U;                 // group stride
+      const bool pow2 = grp != 0 && (grp & (grp - 1)) == 0;
+      const ir::BasicBlock *pre = (bi > 0) ? &fn.blocks[bi - 1] : 0;
+      const bool preOK = pre && !pre->insts.empty() &&
+                         pre->insts.back().op == ir::Op::BRX &&
+                         !pre->insts.back().target.empty();
+      if (pow2 && preOK) {
+        const std::string exitLabel = pre->insts.back().target;
+        const std::string loopLabel = b.label;
+        const std::string mainLabel = loopLabel + "$uw";
+        const ir::Inst addI = add, cmpI = cmp, brxI = brx;    // copies (b realloc'd below)
+        const std::vector<ir::Inst> body = b.insts;           // capture body + latch
+        std::set<uint32_t> ivSet(addrIV.begin(), addrIV.end());
+
+        bool usesCounter = false;
+        for (int i = 0; i < n - 3 && !usesCounter; ++i) {
+          const ir::Operand *s[3] = {&body[i].s1, &body[i].s2, &body[i].s3};
+          for (int k = 0; k < 3; ++k)
+            if (s[k]->kind == ir::Operand::Reg && s[k]->value == counter) usesCounter = true;
+        }
+
+        // MAIN body: U copies, shared IVs advanced between copies, no predicate.
+        std::vector<ir::Inst> mainI;
+        for (int c = 0; c < U; ++c) {
+          std::map<uint32_t, uint32_t> ren;
+          for (std::set<uint32_t>::iterator it = steadyDefs.begin(); it != steadyDefs.end(); ++it)
+            ren[*it] = fn.regs.nextVReg++;
+          if (c > 0 && usesCounter) {                          // copy sees counter + c*step
+            uint32_t cimm = fn.regs.nextVReg++, ivc = fn.regs.nextVReg++;
+            ren[counter] = ivc;
+            ir::Inst li; li.op = ir::Op::LOADI; li.type = ir::Type::U32;
+            li.dst = ir::Operand::reg(cimm); li.hasImm = true; li.imm = (uint32_t)c * step;
+            mainI.push_back(li);
+            ir::Inst ad; ad.op = ir::Op::ADD; ad.type = ir::Type::U32;
+            ad.dst = ir::Operand::reg(ivc);
+            ad.s1 = ir::Operand::reg(counter); ad.s2 = ir::Operand::reg(cimm);
+            mainI.push_back(ad);
+          }
+          for (int i = 0; i < n - 3; ++i) {
+            ir::Inst in = body[i];
+            if (in.op == ir::Op::ADD && in.dst.kind == ir::Operand::Reg &&
+                ivSet.count(in.dst.value)) continue;           // drop IV self-increment
+            renameOperand(in.dst, ren); renameOperand(in.s1, ren);
+            renameOperand(in.s2, ren); renameOperand(in.s3, ren);
+            mainI.push_back(in);
+          }
+          for (unsigned a = 0; a < addrIV.size(); ++a) {       // inter-copy IV advance
+            ir::Inst adv; adv.op = ir::Op::ADD; adv.type = ir::Type::U32;
+            adv.dst = ir::Operand::reg(addrIV[a]);
+            adv.s1 = ir::Operand::reg(addrIV[a]); adv.s2 = ir::Operand::reg(addrStride[a]);
+            mainI.push_back(adv);
+          }
+        }
+        uint32_t maskReg = fn.regs.nextVReg++, kmainReg = fn.regs.nextVReg++, ustepReg = fn.regs.nextVReg++;
+        uint32_t pMain = fn.regs.nextPred++, pEntry = fn.regs.nextPred++, pRem = fn.regs.nextPred++;
+        { ir::Inst li; li.op = ir::Op::LOADI; li.type = ir::Type::U32;
+          li.dst = ir::Operand::reg(ustepReg); li.hasImm = true; li.imm = grp; mainI.push_back(li); }
+        { ir::Inst ad = addI; ad.s2 = ir::Operand::reg(ustepReg); mainI.push_back(ad); }  // counter += U*step
+        { ir::Inst c2 = cmpI; c2.dst = ir::Operand::pred(pMain); c2.s2 = ir::Operand::reg(kmainReg);
+          mainI.push_back(c2); }                                                          // CMPP.lt Pm,counter,kmain
+        { ir::Inst bx = brxI; bx.guard = (int)pMain; bx.guardNeg = false; bx.target = mainLabel;
+          mainI.push_back(bx); }                                                          // BRX Pm -> main
+
+        // main-guard: kmain = bound & ~(grp-1) ; BRX (counter>=kmain) -> remainder
+        std::vector<ir::Inst> guardI;
+        { ir::Inst li; li.op = ir::Op::LOADI; li.type = ir::Type::U32;
+          li.dst = ir::Operand::reg(maskReg); li.hasImm = true; li.imm = ~(grp - 1); guardI.push_back(li); }
+        { ir::Inst an; an.op = ir::Op::AND; an.type = ir::Type::U32;
+          an.dst = ir::Operand::reg(kmainReg); an.s1 = ir::Operand::reg(boundReg);
+          an.s2 = ir::Operand::reg(maskReg); guardI.push_back(an); }
+        { ir::Inst c2 = cmpI; c2.dst = ir::Operand::pred(pEntry); c2.modifier = 5u /*ge*/;
+          c2.s1 = ir::Operand::reg(counter); c2.s2 = ir::Operand::reg(kmainReg); guardI.push_back(c2); }
+        { ir::Inst bx = brxI; bx.guard = (int)pEntry; bx.guardNeg = false; bx.target = loopLabel; guardI.push_back(bx); }
+
+        // rem-guard: BRX (counter>=bound) -> EXIT  (skips a zero-length remainder)
+        std::vector<ir::Inst> remGuardI;
+        { ir::Inst c2 = cmpI; c2.dst = ir::Operand::pred(pRem); c2.modifier = 5u /*ge*/;
+          c2.s1 = ir::Operand::reg(counter); c2.s2 = ir::Operand::reg(boundReg); remGuardI.push_back(c2); }
+        { ir::Inst bx = brxI; bx.guard = (int)pRem; bx.guardNeg = false; bx.target = exitLabel; remGuardI.push_back(bx); }
+
+        ir::BasicBlock guardB;    guardB.insts = guardI;
+        ir::BasicBlock mainB;     mainB.label = mainLabel; mainB.insts = mainI;
+        ir::BasicBlock remGuardB; remGuardB.insts = remGuardI;
+        std::vector<ir::BasicBlock> ins;
+        ins.push_back(guardB); ins.push_back(mainB); ins.push_back(remGuardB);
+        fn.blocks.insert(fn.blocks.begin() + bi, ins.begin(), ins.end());
+        bi += 3;                     // skip the inserted blocks; ++bi skips remainder `b`
+        changed = true;
+        continue;
+      }
+    }
 
     // Remainder predication for a non-divisible trip: copies c>=1 whose induction
     // value iv_c >= bound must skip their memory ops (out-of-range read) and
