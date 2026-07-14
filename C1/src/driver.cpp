@@ -452,8 +452,12 @@ std::string disassemble(const binfmt::Image &image) {
         else    std::snprintf(b, sizeof(b), "CPY.%s R%u, R%u", tn, dst, src1);
         s += b; break;
       }
-      case isa::Op::CMPP: case isa::Op::CMP:
+      case isa::Op::CMPP:   // writes a predicate destination
         std::snprintf(b, sizeof(b), "%s.%s.%s P%u, R%u, R%u",
+            isa::opName(op), cmpName((ctrl >> 8) & 0x7), tn, dst, src1, src2);
+        s += b; break;
+      case isa::Op::CMP:    // writes a 0/1 GPR destination
+        std::snprintf(b, sizeof(b), "%s.%s.%s R%u, R%u, R%u",
             isa::opName(op), cmpName((ctrl >> 8) & 0x7), tn, dst, src1, src2);
         s += b; break;
       case isa::Op::BR:
