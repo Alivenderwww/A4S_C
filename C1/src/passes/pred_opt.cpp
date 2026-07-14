@@ -16,6 +16,7 @@
 #include "aec/passes.h"
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -123,15 +124,46 @@ bool predOpt(ir::Function &fn, const Options &opt) {
   }
   const int lastGuard = guardBlk.back();
 
-  // 3. Predicate every memory op in the guarded body (blocks after the last
-  //    guard, excluding the exit block) with the combined keep predicate.
+  // 3. Identify the guarded body: blocks after the last guard, excluding the
+  //    exit/merge block (where lanes reconverge) and the guard blocks. Lanes
+  //    that fail the guard fall straight through this region.
+  std::vector<char> inBody(n, 0);
   for (int bi = 0; bi < n; ++bi) {
     bool isGuard = false;
     for (size_t k = 0; k < guardBlk.size(); ++k) isGuard |= (guardBlk[k] == bi);
-    if (isGuard || bi == exitIdx || bi < lastGuard) continue;
+    if (!(isGuard || bi == exitIdx || bi < lastGuard)) inBody[bi] = 1;
+  }
+
+  // A register defined in the body but READ outside it (at/after the merge point,
+  // or before the guard) holds a value the reconverged code depends on, so a
+  // masked-off lane must NOT overwrite it -- its defining instruction has to be
+  // predicated. This is the `cond ? a : b` case: the body's write to the result
+  // register escapes to the merge block. A value consumed only inside the body
+  // feeds a (predicated) memory op, so it can stay unpredicated -- which is what
+  // keeps loop counters (dead after the loop, hence not escaping) uniform and
+  // the loop's own BRX condition warp-uniform.
+  std::set<uint32_t> usedOutside;
+  for (int bi = 0; bi < n; ++bi) {
+    if (inBody[bi]) continue;
+    for (size_t ii = 0; ii < fn.blocks[bi].insts.size(); ++ii) {
+      const ir::Inst &in = fn.blocks[bi].insts[ii];
+      const ir::Operand *srcs[3] = {&in.s1, &in.s2, &in.s3};
+      for (int u = 0; u < 3; ++u)
+        if (srcs[u]->kind == ir::Operand::Reg) usedOutside.insert(srcs[u]->value);
+    }
+  }
+
+  // 4. Predicate, within the body, every memory op (out-of-bounds safety) and
+  //    every non-terminator whose result escapes the body (correctness of the
+  //    reconverged value), all under the combined keep predicate.
+  for (int bi = 0; bi < n; ++bi) {
+    if (!inBody[bi]) continue;
     for (size_t ii = 0; ii < fn.blocks[bi].insts.size(); ++ii) {
       ir::Inst &in = fn.blocks[bi].insts[ii];
-      if (isMemOp(in.op) && in.guard < 0) in.guard = keep;
+      if (in.guard >= 0 || in.isTerminator()) continue;
+      const bool escapes = in.dst.kind == ir::Operand::Reg &&
+                           usedOutside.count(in.dst.value) != 0;
+      if (isMemOp(in.op) || escapes) in.guard = keep;
     }
   }
 

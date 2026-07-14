@@ -29,7 +29,7 @@ OD_OBJ := obj/tools/aec-objdump.o
 CC_BIN := bin/aec-cc$(EXE)
 OD_BIN := bin/aec-objdump$(EXE)
 
-.PHONY: all build submit test clean selftest
+.PHONY: all build submit test conformance clean selftest
 all: build submit
 
 build: $(CC_BIN) $(OD_BIN)
@@ -72,6 +72,14 @@ selftest: $(CC_BIN)
 # Compile + disassemble every public PTX test.
 test: build
 	bash tests/run_public.sh
+
+# CModel conformance regression: divergence (partial-block bounds guards,
+# `cond ? a : b` if-conversion) + ISA coverage (%laneid, SHL.u32, shr, bitwise,
+# min/max) -- the scenarios the 5 public cases (verify.py) never exercise.
+# Needs the x86-64 golden model (public/aec-cmodel-release); run on an x86 Linux
+# host or under WSL.
+conformance: build
+	python3 sim/cmodel/conformance.py
 
 clean:
 	rm -rf obj bin

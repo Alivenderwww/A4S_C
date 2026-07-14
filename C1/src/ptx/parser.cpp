@@ -76,9 +76,15 @@ void splitDotted(const std::string &w, std::string &base,
 Operand classifyOperand(const std::string &tok) {
   Operand o;
   if (!tok.empty() && tok[0] == '%') {
-    if (tok.find('.') != std::string::npos) {
+    const std::string body = tok.substr(1);
+    // Special registers: the dimensioned ones (tid.x, ntid.x, ctaid.x, ...)
+    // carry a '.'; %laneid and %warpid are dotless. Anything else %-prefixed
+    // (%r1, %rd2, %f3, %p0) is a virtual register. Missing the two dotless
+    // specials here silently lowered `%laneid` to a garbage register read.
+    if (body.find('.') != std::string::npos ||
+        body == "laneid" || body == "warpid") {
       o.kind = Operand::Special;
-      o.name = tok.substr(1);          // drop '%': "tid.x"
+      o.name = body;                   // drop '%': "tid.x" / "laneid"
     } else {
       o.kind = Operand::Reg;
       o.name = tok;                    // keep '%': "%rd1"

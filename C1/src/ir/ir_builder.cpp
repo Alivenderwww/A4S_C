@@ -337,8 +337,11 @@ void Builder::translate(const ptx::Instruction &s) {
   if (m == "and")  { lowerBinary(Op::AND, ty == Type::NONE ? Type::B32 : ty, s); return; }
   if (m == "or")   { lowerBinary(Op::OR,  ty == Type::NONE ? Type::B32 : ty, s); return; }
   if (m == "xor")  { lowerBinary(Op::XOR, ty == Type::NONE ? Type::B32 : ty, s); return; }
-  if (m == "shl")  { lowerBinary(Op::SHL, ty == Type::NONE ? Type::B32 : ty, s); return; }
-  if (m == "shr")  { lowerBinary(Op::SHR, ty == Type::NONE ? Type::B32 : ty, s); return; }
+  // PTX `shl.b32` lowers to `SHL.u32`, not `SHL.b32`: the AEC CModel only
+  // accepts the u32 type code for SHL (organizer ruling; spec updated to match).
+  // `shr` is already u32 in the PTX subset (`shr.u32`), which the CModel accepts.
+  if (m == "shl")  { lowerBinary(Op::SHL, Type::U32, s); return; }
+  if (m == "shr")  { lowerBinary(Op::SHR, ty == Type::NONE ? Type::U32 : ty, s); return; }
 
   if (m == "setp") {
     if (s.operands.size() < 3) return;
