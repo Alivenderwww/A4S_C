@@ -42,7 +42,10 @@ from runtime.mock_runtime import MockRuntime
 # not guaranteed to match the dev layout, so resolve defensively.
 def _resolve_models_dir():
     candidates = [
-        # repo layout: C3/../public/Agentic4SystemSummerSchoolContest/.../models
+        # repo layout: C3/../public/Track-C/C3-scheduler/.../models  (actual)
+        os.path.join(_C3_ROOT, "..", "public", "Track-C",
+                     "C3-scheduler", "testcases", "release_to_competitors", "models"),
+        # repo layout (legacy, from upstream contest skeleton)
         os.path.join(_C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest",
                      "Track-C", "C3-scheduler", "testcases", "release_to_competitors", "models"),
         # server/flat layout: models directly under C3_ROOT (e.g. ~/A4S/c3/*.onnx)
@@ -53,8 +56,11 @@ def _resolve_models_dir():
     for d in candidates:
         if os.path.isdir(d) and any(f.endswith(".onnx") for f in os.listdir(d)):
             return os.path.normpath(d)
-    # fall back to the canonical repo path (will error clearly if still missing)
-    return os.path.normpath(candidates[0])
+    # All candidates exhausted → fail clearly
+    raise FileNotFoundError(
+        f"C3.2 benchmark: no model directory found among {candidates}. "
+        "Place .onnx files in one of these locations or point --models at a custom path."
+    )
 
 
 _MODELS_DIR = _resolve_models_dir()

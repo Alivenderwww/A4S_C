@@ -628,9 +628,9 @@ def test_conv_bn_extra_output_graph_out():
     check("FusedConv2dBatchNorm" not in _log_patterns(log), "BN extra output 是 graph output → 不报")
 
 
-def test_prefuse_conv_bn_noop():
-    """prefuse_conv_bn returns empty list, graph/initializers completely unchanged."""
-    print("\n# 单元测试: prefuse_conv_bn 安全 no-op")
+def test_prefuse_conv_bn_prefolded_annotation():
+    """A biased Conv is annotated as pre-folded BN without rewriting graph data."""
+    print("\n# 单元测试: prefuse_conv_bn 预折叠 annotation 不改图")
     from scheduler.graph_passes.fusion import prefuse_conv_bn
     rng = np.random.default_rng(42)
     w = rng.standard_normal((4, 1, 1, 1)).astype(np.float32)
@@ -643,7 +643,12 @@ def test_prefuse_conv_bn_noop():
         outputs=[TensorInfo("out")],
         initializers=init)
     result = prefuse_conv_bn(g)
-    check(len(result) == 0, f"prefuse_conv_bn 返回空列表 (实际 {len(result)})")
+    check(len(result) == 1, f"prefuse_conv_bn 返回 1 条 annotation (实际 {len(result)})")
+    if result:
+        check(result[0].get("pattern") == "FusedConv2dBatchNorm",
+              f"annotation pattern 正确 (实际 {result[0].get('pattern')})")
+        check(result[0].get("nodes") == ["conv"],
+              f"annotation 仅引用预折叠 Conv (实际 {result[0].get('nodes')})")
     # Graph structure unchanged
     check(len(g.nodes) == 1, "graph 节点数不变")
     check(g.nodes[0].op_type == "Conv", "Conv 节点保留")
@@ -2398,7 +2403,7 @@ def main() -> int:
     test_conv_bn_bad_params()
     test_conv_bn_extra_output_consumed()
     test_conv_bn_extra_output_graph_out()
-    test_prefuse_conv_bn_noop()
+    test_prefuse_conv_bn_prefolded_annotation()
     test_correctness_numeric_align()
     # C3.3 Task 1-4 微图 / MLP 结构测试
     test_gemm_to_matmul_bias_default()

@@ -20,7 +20,10 @@ from .hardware import HardwareModel, hardware
 from .precision import PrecisionProfile, is_sensitive
 from .kernels import KernelSpecRef, KernelTuningParams
 from .strategy import Strategy, strategy
-from .memory import MemoryPlanner, DeviceMemoryPool, build_execution_plan
+from .memory import (
+    MemoryPlanner, DeviceMemoryPool, build_execution_plan,
+    TensorBinding, PlanStep, ExecutionPlan, validate_execution_plan,
+)
 from .graph_passes.pipeline import GraphPassPipeline
 
 __all__ = [
@@ -40,4 +43,8 @@ __all__ = [
     "MemoryPlanner",
     "DeviceMemoryPool",
     "build_execution_plan",
+    "TensorBinding",
+    "PlanStep",
+    "ExecutionPlan",
+    "validate_execution_plan",
 ]

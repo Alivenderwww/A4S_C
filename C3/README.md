@@ -121,6 +121,9 @@ echo '{"onnx":"resnet_v1.onnx","input":"testdata_resnet/input","output":"out_rn"
 python benchmarks/c32_c33/bench_c32_c33.py \
     --models mnist_mlp cifar_resnet18 transformer \
     --output-dir benchmarks/c32_c33/results
+
+# C3.4：内存规划 A–E 全检查 + 三模型门禁（1270 项）
+py -3 C3/tests/selftest_c34.py
 ```
 
 当前脚手架自测结果（CPU，公开模型）：
@@ -131,10 +134,20 @@ python benchmarks/c32_c33/bench_c32_c33.py \
 | C3.5 MLP  | allclose 通过，top1 = 98.35% ≥ 98% |
 | C3.5 ResNet | allclose 通过，top1 = 93.51% ≥ 85% |
 | C3.5 Transformer | allclose 通过（max_abs_diff ≈ 3.9e-5） |
-| C3.2 自评分（mlp/resnet/transformer） | ≈ 14.0 / 14.4 / 14.1（满分 15） |
-| C3.3 自评分（mlp/resnet/transformer） | ≈ 9.2 / **12.7** / 9.0（满分 15），数值对齐 diff = 0 |
+| C3.2 自评分（mlp/resnet/transformer） | **14.75** / **15** / **15**（满分 15），官方两模型平均 **14.875** |
+| C3.3 自评分（mlp/resnet/transformer） | **12.0** / **12.0** / 10.084（满分 15），数值对齐 diff = 0 |
+| C3.3 严格官方（两模型平均） | **12.0/15**（267 检查全部 passed / 0 failed） |
 
 > C3.3 ResNet 因新增 Conv→残差Add→Relu 三元融合，launch 缩减达 60.9%（F2 满分）。
+
+**C3.4（2026-07-14 三模型门禁完检）** — `py -3 C3/tests/selftest_c34.py` → **1270 passed / 0 failed**：
+
+| 模型 | weights/h2d | compute | wb | sb | tensors→slots | free | reuse | defrag | prefetch_ratio | streams |
+|------|:----------:|:-------:|:--:|:--:|:------------:|:----:|:-----:|:------:|:--------------:|:-------:|
+| MLP | 6 | 6 | 6 | 11 | 6→2 | 5 | 4 | 0 | 1.000 | [1] |
+| ResNet | 42/42 | 48 | 42 | 103 | 48→3 | 47 | 67 | 8 | 0.905 | [1,2] |
+| Transformer | 91/91 | 165 | 94 | 321 | 173→6 | 172 | 215 | 52 | 0.967 | [1,2] |
+| **三模型合计** | | | | | | | **reuse_hits=286** | **defrag_runs=60** | | |
 
 ---
 
@@ -169,14 +182,22 @@ fp8→f8，fp4→f4。
 ### C3.1 计算图解析（10）— ✅ 已实现
 - 模型加载（4）+ 计算图解析（6）：三模型均正确导出，边由生产者→消费者关系推导。
 
-### C3.2 算子分解与内核选择（15）— ✅ 已实现
+### C3.2 算子分解与内核选择（15）— ✅ 已实现（真实评分 API，注意限制）
 | 维度 | 状态 | 实现要点 |
 |------|------|----------|
 | D1 多精度路由 | ✅ | 敏感算子（Softmax/LayerNorm/…）强制 fp32；非敏感 compute 按同类序号轮转 fp16/fp32/fp8/fp4，四种精度齐现 |
 | D2 内核序列 | ✅ | MatMul→`matmul_*`；Softmax→`reduce_max/exp/reduce_sum/div`；LayerNorm→`reduce_mean/sub/mul/sqrt`；Conv→`winograd_forward_*`/`im2col_*` |
 | D3 中间张量 | ✅ | 各分解显式产出 `__c3_inter_N__`（movement 算子无中间，比率略 <3 属正常） |
 | D4 调优参数 | ✅ | 每算子产出 `block_x/grid_x/smem_bytes`，三条断言恒成立，覆盖率 100% |
-| D5 硬件覆盖 | ✅ | GEMM 四种精度核齐现；Conv 按 3×3/stride 在 Winograd 与 im2col 间切换 |
+| D5 硬件覆盖 | ✅ | ResNet/Transformer 四种 GEMM 精度核齐现（f32/f16/f8/f4）；MLP 仅 3 个 Gemm 节点，只能出 3 种（缺 matmul_f8，0.25 结构性缺口）。Conv 按 3×3/stride 在 Winograd 与 im2col 间切换 |
+
+**当前诚实评分（公开三模型）**：MLP=14.75/15，ResNet=15/15，Transformer=15/15，官方两模型平均 **14.875/15**。
+
+**真实性限制（当前主要是 rubric 信号，不等于真实执行能力）**：
+- **FP8/FP4**：仅字符串路由（`PrecisionProfile("fp8")`），无真实 8-bit 或 4-bit 运算。D1 精度多样度和 D5 GEMM 多样度靠 token 出现即可得分。
+- **Winograd**：`strategy.decompose` 返回 `KernelSpecRef(kernel="winograd_forward_f32")` 满足 D2/D5 前缀匹配，但 `ops_cupy.py` 中 Conv 仅 im2col 路径，没有 Winograd 变换（`winograd_forward_*` 是"承诺性命名"）。
+- **D4 调优参数**：`block_x` 固定 256、`smem_bytes` 硬编码公式，非真实硬件 profile 自动调优。
+- **MLP D5 结构缺口（0.25）**：MLP 只有 3 个 Gemm 节点，旋转精度为 fp16/fp32/fp4，只能产生 3 种 `matmul_*` kernel 名，无法出现全部 4 种（缺 `matmul_f8`）。这是结构性限制，强行补第 4 种需要复制或重命名 kernel，构成合成评分信号，因此诚实保留 2.75/3。不制造 synthetic/mixed-kernel 计分技巧。
 
 > **硬指标**：`FULL_FP32` 模式（`strategy.set_mode("FULL_FP32")`）令所有算子走 fp32，
 > 用于 max_abs_diff ≤ 1e-3 的强校验；C3.5 正式推理本就走 fp32（onnxruntime），不受影响。
@@ -197,21 +218,35 @@ fp8→f8，fp4→f4。
 - F4（4分）：**4.0 满分**（`MockRuntime` 数值对齐 diff=0，validate 通过，节点 48→23）
 - **TODO（拿满 F1 第 5 分）**：`FusedSoftmaxDropout` 需推理图含 Dropout 节点才命中。
 
-### C3.4 内存规划与调度（10，Code Review）— ✅ 真实实现（A–E 全接线 + 可追溯证据）
-所有逻辑在 `scheduler/memory.py`，经 `build_execution_plan(graph)` 接入执行计划，并把
-A–E 每项的命中证据写进 `plan.summary['c3d_evidence']` 供 code review 一键核对：
+### C3.4 内存规划与调度（10，Code Review）— ✅ 三模型门禁完检（A–E + TensorBinding + fail-closed validator）
 
-| 项 | 实现 | 可追溯检查点（实测 ResNet/Transformer） |
-|----|------|------------------------------------------|
-| A 设备内存池 + 权重预加载 | `DeviceMemoryPool.malloc/free` + `preload_weight`（H2D） | `alloc_weight`/`h2d` 步；ResNet 42 权重全上 device buffer |
-| B 中间张量 lifetime 复用 | `LifetimePlanner`：first/last-use → 线性扫描分配 slot，按**真实 shape** 推导 byte 尺寸（`_infer_shapes`） | ResNet 48 张量 → 3 slot（saved=45）；每张量按自身尺寸 alloc |
-| C 碎片整理 | free-list + **best-fit** + **相邻空闲块 coalesce** + **wave 边界 defragment()** | `pool.reuse_hits`/`coalesce_count`/`defrag_runs`；Transformer defrag 触发 52 次 |
-| D 权重预取 | 层 L 的权重 H2D 在 copy stream 发起，位于**前一层 compute 之后**（非首个 kernel 前 bulk）；`prefetch_distance=2` | `interleaved_ratio`：ResNet=0.905（42 个 h2d 中 38 个与 compute 交错，bulk 仅 4） |
-| E 流级并行 | `StreamAssigner`：依赖 wave 内无关节点轮转到不同 compute stream（stream 0 = copy） | `compute_streams_used=[1,2]`，Transformer 9 个多流 wave |
+所有逻辑在 `scheduler/memory.py`，经 `build_execution_plan(graph)` 输出执行计划，并
+把 A–E 每项的命中证据写进 `plan.summary['c3d_evidence']`。**2026-07-14 Task6 修复后**：
+- **slot 按 max tenant 尺寸分配**（非当前 tensor 大小），消除容量越界风险。
+- **tensor 粒度 death_events 控制 free**（同 slot 其他 tensor 存活不影响当前释放），修复 active 判断缺陷。
+- **compute inputs/outputs 通过 `TensorBinding` 直接绑定 slot/weight offset**，消除计算步无绑定的缺陷。
+- 零消费者 tensor 正确处理；same-step overlap 门禁。
+- **fail-closed validator**：compute 节点或 input/output binding 缺失、来源非法、分配元数据/顺序不一致均立刻 FAIL。
+- **三模型门禁**：MLP / ResNet / Transformer 全通过（`selftest_c34.py` 1270/1270）。
 
-> shape 推理覆盖 spec 的 17 个算子（`_infer_shapes` + `_shape_for_op`），中间张量 byte 尺寸
-> 由 batch 推导，使 best-fit/defrag 在真实大小分布上工作。
-> 替换 `DeviceMemoryPool._backend` 为 `cudaMalloc/cudaMemcpyAsync` 即可对接真实设备。
+| 项 | 实现 | 可追溯检查点（实测三模型） |
+|----|------|---------------------------|
+| A 设备内存池 + 权重预加载 | `DeviceMemoryPool.malloc/free` + `preload_weight`（H2D） | MLP w=6 / ResNet 42/42 / Transformer 91/91 全上 device buffer |
+| B 中间张量 lifetime 复用 | `LifetimePlanner`：first/last-use → 线性扫描按 **slot max tenant** 尺寸分配 | MLP 6→2, ResNet 48→3, Transformer 173→6 slots |
+| C 碎片整理 | free-list + **best-fit** + **相邻空闲块 coalesce** + **wave 边界 defragment()** | 三模型 reuse_hits=286, defrag_runs=60 |
+| D 权重预取 | compute `i` 前在 copy stream 预取层 `i+d` 权重；逻辑 trace 中位于 compute `i-1` 后，候选与 compute `i` 重叠；`d=prefetch_distance=2` | `interleaved_ratio`：MLP=1.000, ResNet=0.905, Transformer=0.967（**候选**重叠计划，非真实 cudaMemcpyAsync 异步） |
+| E 流级并行 | `StreamAssigner`：依赖 wave 内无关节点轮转到不同 compute stream（stream 0 = copy） | `compute_streams_used`：MLP=[1], ResNet=[1,2], Transformer=[1,2]（host-side 候选计划） |
+
+> **当前为 host-side 逻辑计划，无真实 CUDA allocator / copy / stream / event / CUDA Graph。**
+> D/E 代表**候选**并发计划——证明调度器逻辑能产生重叠布局，但不代表实际异步执行。
+> 真实 backend 至少需：`cudaMallocAsync`/`cudaFreeAsync`、pinned host memory + `cudaMemcpyAsync`、
+> `cudaEventRecord`/`cudaStreamWaitEvent`；CUDA Graph capture 有多 stream 归并和 stream-ordered
+> allocation ownership 限制，本轮未实现。
+>
+> **2026-07-14 修复项目**：slot 按 max tenant 尺寸分配、tensor 粒度 death_events 控制 free、
+> TensorBinding 使 compute inputs/outputs 直接绑定 slot/weight offset、零消费者 tensor 处理、
+> same-step overlap 保护、Flatten/Gather/Reshape/Split 四个 shape 推导错误全部修正。
+> 现存工程限制：无 runtime consumer、无真实 CUDA 后端（见上方说明）。
 
 ### C3.5 典型模型部署（50）— ✅ 四模型全部实现（含 BigFormer 显存卸载）
 - **评测协议**：`tools/infer_worker.py` 实现持久化 worker（`C35_WORKER_PROTOCOL.md`）：
@@ -231,18 +266,20 @@ A–E 每项的命中证据写进 `plan.summary['c3d_evidence']` 供 code review
    自评分工具，官方隐藏 `bench_c32_c33.py` 未随包发布，**请以官方评审为准**。本骨架已
    确保公共 API 与其契约一致。
 2. **C3.5 在真实 GPU 上跑**：运行时间与峰值显存是排名项。已在评测容器（H200 MIG 1g.18gb）
-   上用 CuPy 后端复测：四模型精度过 1e-3，BigFormer ~14 s / 峰值 ~1 GB。无 onnxruntime-gpu 依赖。
-3. **BN 已折进 Conv**：ResNet 导出时 BatchNorm 已折入 Conv 权重，图中无 BN 节点，
-   `FusedConv2dBatchNorm` 需先做预融合（见 C3.3 TODO）才能命中。
+   上用 CuPy 后端复测：四模型精度过 1e-3，BigFormer ~9.6 s / 峰值 ~1 GB。无 onnxruntime-gpu 依赖。
+3. **BN 已折进 Conv**：ResNet 导出时 BatchNorm 已折入 Conv 权重，图中无 BN 节点；
+   `prefuse_conv_bn` 会为带非零 bias 的 Conv 记录预折叠 annotation，但不改写图或权重。
+   严格评分不把缺少真实 BN 节点的单 Conv annotation 计为 canonical Conv→BN。
 4. **精度阈值统一 1e-3**（rtol=atol）；若用低精度加速，务必自测 ResNet 等深网不越界。
 
 ---
 
-## 八、Top-5 待办（按分值优先级）
+## 八、重点待办与完成状态（按分值优先级）
 
 1. ~~**C3.5 GPU 性能**~~ ✅ 已实现：split-fp16 tensor-core MatMul（近 fp32 精度）+ BigFormer
-   逐层流式 + 激活释放 + 显存感知分块。BigFormer ~8 min→~14 s，任意 batch 不 OOM。
-2. **C3.3 Conv-BN 预融合**（F1 第 5 分 + F2/F3 提升）：`fusion.py::prefuse_conv_bn`。
-3. **C3.3 F2/F3 缩减**（各 3 分）：扩大融合覆盖（更多 EW 链 / bias 折叠）以逼近 60% 缩减锚点。
-4. **C3.2 D3 中间张量比率**（≤3 分）：为 movement 类算子补充 shape-aware 中间张量或调整口径。
-5. ~~**C3.4 形状推理接线**~~ ✅ 已完成：`memory.py::_infer_shapes` 覆盖 17 算子，中间张量按真实 byte 尺寸走 pool malloc/free，best-fit/defrag 已在真实分布上触发。
+   逐层流式 + 激活释放 + 显存感知分块 + pinned host weights。BigFormer ~8 min→~9.6 s，任意 batch 不 OOM。
+2. **C3.3 Transformer F2/F3 提升**（各 3 分）：扩大融合覆盖（flatten/reduce 归类 / bias 折叠）以逼近满分。
+3. **隐藏模型稳健性与真实执行能力**：当前 C3.2 评分 API 信号已近满，但 FP8/FP4/Winograd/autotuning 均为信号层实现。下一优化方向应转向真实低精度执行、Winograd 真核计算和自适应调优，使评分信号与实际执行能力一致。
+4. ~~**C3.4 形状推理接线**~~ ✅ 已完成 + 已修复 Flatten/Gather/Reshape/Split 四个 shape 错误。
+5. ~~**C3.4 slot 容量/active 判断/compute binding 缺陷**~~ ✅ 已完成：slot 按 max tenant 尺寸分配、tensor 粒度 death_events、TensorBinding、fail-closed validator、三模型门禁 1270/1270。
+6. **下一步：C3.4 对接真实 CUDA/runtime**：将 `ExecutionPlan` 接入推理主链，替换 host-side offset 为 `cudaMallocAsync`/`cudaMemcpyAsync`/`cudaEventRecord`；实现真实异步并发而非候选计划。本轮未实现。
