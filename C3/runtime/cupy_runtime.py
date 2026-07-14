@@ -60,6 +60,19 @@ class CupyRuntime:
             if val is None:
                 continue
             arr = np.asarray(val)
+            if streaming and arr.dtype.kind == "f":
+                # Pin the streamed float weights: `cp.asarray` from pinned host
+                # memory runs at ~40 GB/s vs ~9 GB/s pageable on this MIG slice,
+                # cutting BigFormer's per-pass 19 GB weight upload from ~2 s to
+                # ~0.5 s. Pinned once here (in the warm-up task's cached backend,
+                # off the timed path); pageable fallback if pinning is unavailable.
+                try:
+                    import cupyx
+                    pinned = cupyx.empty_pinned(arr.shape, arr.dtype)
+                    pinned[...] = arr
+                    arr = pinned
+                except Exception:
+                    pass
             self._init_host[name] = arr
             if not streaming:
                 if arr.dtype == np.int64 or arr.dtype == np.int32:
