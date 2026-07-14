@@ -18,6 +18,7 @@ remote_exec.py — 在远程服务器（mig02）上执行命令，供 Code Agent
 
 import io
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -45,18 +46,22 @@ remote_exec.py — 在远程服务器执行命令（供 Agent 调用，跨平台
   ssh -i ./mig02 mig02@39.107.68.147 -p 1102
 
 用法:
-  python remote_exec.py [--dry-run] [--json] <command...>
+  python remote_exec.py [--dry-run] [--json] [--raw-shell] <command...>
   python remote_exec.py --help | -h
 
   command   要在远程执行的命令。含 && / | / 变量 / 重定向 时整体加引号：
               python remote_exec.py "cd ~/A4S && make -j2"
 
 选项:
-  --dry-run   只打印将执行的 ssh 命令，不真正连接（不需要私钥）。
-  --json      不实时流式输出，结束后向 stdout 打印一个 JSON：
-              {"exit": N, "stdout": "...", "stderr": "...", "command": "..."}
-              适合 Agent 程序化解析（短命令）。
-  -h, --help  显示本帮助。
+  --dry-run     只打印将执行的 ssh 命令，不真正连接（不需要私钥）。
+  --json        不实时流式输出，结束后向 stdout 打印一个 JSON：
+                {"exit": N, "stdout": "...", "stderr": "...", "command": "..."}
+                适合 Agent 程序化解析（短命令）。
+  --raw-shell   不包装为 bash -lic 命令，直接透传字符串。
+                默认将命令包装为 bash -lic '<command>' 以加载远端
+                profile/.bashrc（登录 + 交互 shell）。--raw-shell
+                保留旧裸命令行为。
+  -h, --help    显示本帮助。
 
 示例:
   python remote_exec.py uname -a
@@ -88,6 +93,7 @@ def parse_args(argv):
     """手动解析，保证对 - 开头的远程参数零误判。"""
     dry_run = False
     json_out = False
+    raw_shell = False
     rest = []
     for a in argv:
         if a in ("-h", "--help"):
@@ -97,14 +103,18 @@ def parse_args(argv):
             dry_run = True
         elif a == "--json":
             json_out = True
-        elif a.startswith("--") and a not in ("--dry-run", "--json"):
+        elif a == "--raw-shell":
+            raw_shell = True
+        elif a.startswith("--") and a not in (
+            "--dry-run", "--json", "--raw-shell",
+        ):
             die(f"未知选项 {a!r}")
         else:
             rest.append(a)
 
     if not rest:
         die("缺少要执行的远程命令。用 --help 查看用法。")
-    return dry_run, json_out, rest
+    return dry_run, json_out, raw_shell, rest
 
 
 def prepare_key() -> Path:
@@ -152,9 +162,22 @@ def build_ssh_argv(ssh_bin: str, key: Path, remote_cmd: str):
     return [ssh_bin, "-i", str(key), *opts, "-p", PORT, f"{USER}@{HOST}", remote_cmd]
 
 
+def wrap_remote_command(remote_cmd: str, raw_shell: bool = False) -> str:
+    """包装远程命令为 bash -lic '<original>'.
+
+    默认返回 ``bash -lic <shlex.quote(remote_cmd)>``，使得远端通过
+    登录 + 交互 Bash 执行命令（加载 profile/.bashrc）。
+    当 *raw_shell* 为 True 时返回原命令不变。
+    """
+    if raw_shell:
+        return remote_cmd
+    return f"bash -lic {shlex.quote(remote_cmd)}"
+
+
 def main() -> int:
-    dry_run, json_out, command = parse_args(sys.argv[1:])
+    dry_run, json_out, raw_shell, command = parse_args(sys.argv[1:])
     remote_cmd = " ".join(command)
+    wrapped_cmd = wrap_remote_command(remote_cmd, raw_shell=raw_shell)
 
     ssh_bin = shutil.which("ssh") or shutil.which("ssh.exe")
     if not ssh_bin:
@@ -162,13 +185,13 @@ def main() -> int:
 
     if dry_run:
         # dry-run 不需要真实私钥，只用路径占位即可展示将执行的命令
-        argv = build_ssh_argv(ssh_bin, Path(KEY_NAME), remote_cmd)
+        argv = build_ssh_argv(ssh_bin, Path(KEY_NAME), wrapped_cmd)
         shown = " ".join(f'"{a}"' if " " in a else a for a in argv)
         print(f"[dry-run] {shown}")
         return 0
 
     key = prepare_key()
-    argv = build_ssh_argv(ssh_bin, key, remote_cmd)
+    argv = build_ssh_argv(ssh_bin, key, wrapped_cmd)
 
     if json_out:
         import json
