@@ -123,6 +123,7 @@ def is_elf_bytes(data: bytes) -> bool:
 
 def _zinfo_for(path_in_zip: str, mode: int, is_dir: bool = False) -> zipfile.ZipInfo:
     zi = zipfile.ZipInfo(path_in_zip)
+    zi.create_system = 3                               # Unix origin → unzip restores +x
     if is_dir:
         zi.external_attr = ((0o040000 | (mode & 0o7777)) << 16) | 0x10
     else:

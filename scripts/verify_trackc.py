@@ -181,6 +181,10 @@ def layer_a(zip_path: Path, rep: Reporter) -> None:
             rep.add("aec-cc 存在", True, "PASS")
             rep.add("aec-cc 可执行位 (+x)", bool(mode & 0o111),
                     "PASS" if mode & 0o111 else "FAIL", f"mode={oct(mode)}")
+            rep.add("aec-cc ZIP 来源 Unix（create_system==3）",
+                    zi is not None and zi.create_system == 3,
+                    "PASS" if zi is not None and zi.create_system == 3 else "FAIL",
+                    f"create_system={zi.create_system if zi else 'N/A'}")
             rep.add("aec-cc shebang (#!)", head[:2] == b"#!",
                     "PASS" if head[:2] == b"#!" else "FAIL")
             # wrapper root 指向 ./src
@@ -308,14 +312,20 @@ def layer_b(zip_path: Path, rep: Reporter, remote_public: str | None) -> None:
     rep.pass_("上传 zip 到服务器", f"{zip_path.name} -> {remote_base}")
 
     remote_zip = f"{remote_base}/{zip_path.name}"
-    # 2) 解压（用 python3，避免依赖 unzip）
+    # 2) 检查 unzip 可用（必须用 unzip 才能从 ZIP 条目中恢复 Unix 权限位）
+    r = tc.remote_run("unzip -v >/dev/null 2>&1", capture=True)
+    if r.returncode != 0:
+        rep.fail("远端解压 zip", "系统缺少 unzip，无法还原 Unix 文件权限")
+        tc.remote_rmtree(remote_base)
+        return
+
+    # 3) 用 unzip 解压（自动恢复 create_system=3 的 Unix 权限位）
     r = tc.remote_run(
-        f"cd {tc.shell_quote(remote_base)} && python3 -c "
-        f"\"import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall('.')\" {tc.shell_quote(zip_path.name)}",
+        f"cd {tc.shell_quote(remote_base)} && unzip -q {tc.shell_quote(zip_path.name)} 2>&1",
         capture=True, timeout=120,
     )
     if r.returncode != 0:
-        rep.fail("远端解压 zip", r.stderr.strip())
+        rep.fail("远端解压 zip", r.stderr.strip() or f"exit={r.returncode}")
         tc.remote_rmtree(remote_base)
         return
     # 找到解压根
@@ -328,12 +338,11 @@ def layer_b(zip_path: Path, rep: Reporter, remote_public: str | None) -> None:
     root_remote = f"{remote_base}/{roots[0]}"
     rep.pass_("远端解压", roots[0])
 
-    # Python zipfile 解压不一定还原 Unix 可执行位；按 zip 内存储的 0o755 复原
-    # （等价于 unzip 对 aec-cc / *.so 的处理），确保 build-on-first-use 可执行。
+    # unzip 已从 ZIP 中恢复 create_system=3 条目的 Unix 权限
+    # 对 .so 额外 chmod +x 以防 umask 过滤（dlopen 通常不需 x，保留防御）
     tc.remote_run(
         " ".join([
             "chmod", "+x",
-            tc.shell_quote(root_remote + "/C1/compiler/aec-cc"),
             tc.shell_quote(root_remote + "/C2/libaec.so"),
             tc.shell_quote(root_remote + "/C2/lib/libaec_device.so"),
             "2>/dev/null", ";", "true",
