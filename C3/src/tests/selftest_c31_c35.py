@@ -23,15 +23,11 @@ import numpy as np
 _C3_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _C3_ROOT not in sys.path:
     sys.path.insert(0, _C3_ROOT)
+# C3/ (parent of src/) is where models and testdata live.
+_C3_TOP = os.path.dirname(_C3_ROOT)
 
 from scheduler.graph import import_onnx_graph
 from tools import export_dag, infer
-
-# Resolve model/testdata locations defensively: try the repo layout (public/...)
-# first, then the flat server layout (models + testdata_<key> under C3_ROOT).
-_REPO_PUBLIC = os.path.normpath(os.path.join(
-    _C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest", "Track-C",
-    "C3-scheduler", "testcases", "release_to_competitors"))
 
 # server/flat layout maps a model key to its testdata dir name
 _SERVER_TD = {"mlp_v1": "testdata_mlp", "resnet_v1": "testdata_resnet", "transformer_v1": "testdata_tf"}
@@ -39,21 +35,21 @@ _SERVER_TD = {"mlp_v1": "testdata_mlp", "resnet_v1": "testdata_resnet", "transfo
 
 def _resolve_models():
     """Find the directory holding the .onnx files."""
-    # flat layout first: models directly under C3_ROOT
+    # C3/ top-level (grader working dir): C3/*.onnx
+    if any(f.endswith(".onnx") for f in os.listdir(_C3_TOP)
+           if os.path.isfile(os.path.join(_C3_TOP, f))):
+        return _C3_TOP
+    # C3_ROOT (src/) itself
     if any(f.endswith(".onnx") for f in os.listdir(_C3_ROOT)
            if os.path.isfile(os.path.join(_C3_ROOT, f))):
         return _C3_ROOT
-    # fallback: repo layout public/.../models
-    repo_models = os.path.join(_REPO_PUBLIC, "models")
-    if os.path.isdir(repo_models):
-        return repo_models
-    return repo_models  # fallback (will SKIP gracefully if missing)
+    return _C3_TOP  # fallback (will SKIP gracefully if missing)
 
 
 def _resolve_testdata(model_key):
     """Find the testdata dir for one model; returns parent containing input/ & golden/."""
-    # flat layout first: C3_ROOT/testdata_<short>/{input,golden}
-    srv_td = os.path.join(_C3_ROOT, _SERVER_TD.get(model_key, ""))
+    # C3/ top-level: C3_TOP/testdata_<short>/{input,golden}
+    srv_td = os.path.join(_C3_TOP, _SERVER_TD.get(model_key, ""))
     if os.path.isdir(os.path.join(srv_td, "input")):
         return srv_td
     # fallback: repo layout public/.../testdata/c35/<model_key>

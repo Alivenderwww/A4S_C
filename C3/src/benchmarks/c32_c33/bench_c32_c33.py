@@ -32,25 +32,28 @@ import numpy as np
 _C3_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _C3_ROOT not in sys.path:
     sys.path.insert(0, _C3_ROOT)
+# C3/ (parent of src/) is where models and testdata live when the grader runs
+# with C3/ as the working directory.
+_C3_TOP = os.path.dirname(_C3_ROOT)
 
 from scheduler import import_onnx_graph, strategy, hardware, GraphPassPipeline
 from scheduler.graph_passes.fusion import FusionPass
 from runtime.mock_runtime import MockRuntime
 
-# public-model locations: try the repo layout (public/...) first, then the
-# flat server layout (models sit next to C3/). The grader's model directory is
-# not guaranteed to match the dev layout, so resolve defensively.
+# Resolve model directory: models live in C3/ (the working directory), not
+# C3/src/. Search C3_TOP first, then C3_ROOT, then public/ fallbacks.
 def _resolve_models_dir():
     candidates = [
-        # flat layout: models directly under C3_ROOT (e.g. C3/*.onnx)
+        # C3/ top-level (grader working dir): C3/*.onnx
+        _C3_TOP,
+        # C3_ROOT (src/) itself
         _C3_ROOT,
-        # C3_ROOT/models
-        os.path.join(_C3_ROOT, "models"),
-        # repo layout: C3/../public/Track-C/C3-scheduler/.../models  (fallback)
-        os.path.join(_C3_ROOT, "..", "public", "Track-C",
+        # C3_TOP/models
+        os.path.join(_C3_TOP, "models"),
+        # public/ fallbacks
+        os.path.join(_C3_TOP, "public", "Track-C",
                      "C3-scheduler", "testcases", "release_to_competitors", "models"),
-        # repo layout (legacy, from upstream contest skeleton)
-        os.path.join(_C3_ROOT, "..", "public", "Agentic4SystemSummerSchoolContest",
+        os.path.join(_C3_TOP, "public", "Agentic4SystemSummerSchoolContest",
                      "Track-C", "C3-scheduler", "testcases", "release_to_competitors", "models"),
     ]
     for d in candidates:
