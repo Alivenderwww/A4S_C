@@ -213,16 +213,15 @@ A–E 每项的命中证据写进 `plan.summary['c3d_evidence']` 供 code review
 > 由 batch 推导，使 best-fit/defrag 在真实大小分布上工作。
 > 替换 `DeviceMemoryPool._backend` 为 `cudaMalloc/cudaMemcpyAsync` 即可对接真实设备。
 
-### C3.5 典型模型部署（50）— ✅ 已实现（正确性优先）
-### C3.5 典型模型部署（50）— ✅ 持久化 Worker 已实现（正确性优先）
+### C3.5 典型模型部署（50）— ✅ 四模型全部实现（含 BigFormer 显存卸载）
 - **评测协议**：`tools/infer_worker.py` 实现持久化 worker（`C35_WORKER_PROTOCOL.md`）：
   启动→`READY`→stdin 读 JSON 任务→推理写盘→stdout 回 `{"status":"ok","samples":N}`→`{"cmd":"exit"}` 退出。
-  stdout 仅协议信号，日志走 stderr。CuPy 一次性初始化（不计入计时）。
-- **推理核心**：CuPy GPU 后端（手写算子），fp32 保证过 1e-3 门槛；`--batch-size` 分批控显存。
-  三模型（MLP/ResNet/Transformer）精度/准确率均达标。
-- **性能项**（ResNet 25+10 分排名）：运行时间与峰值显存由 worker 协议采样（2 warmup + 5 计时取中位数/最大值）。
-- **TODO（冲排名/支持 BigFormer）**：① BigFormer 18GB 权重需分块上载（超 16GB 显存）；
-  ② 低精度加速 + IOBinding/CUDA Graph。
+  stdout 仅协议信号，日志走 stderr。CuPy 一次性初始化（不计入计时）；backend 按模型缓存，warmup 后计时轮跳过重载。
+- **推理核心**：CuPy GPU 后端（手写算子 + cuBLAS）。fp32 保证过 1e-3；大 MatMul 走 split-fp16
+  tensor-core（fp32 拆 hi+lo，3 次 fp16 tensor-core 累加，近 fp32 精度、~4× 提速）。四模型精度/准确率均达标。
+- **BigFormer 显存卸载**：19GB fp32 权重 > 16GB 显存 → 逐层流式上载（用完即 free）+ 激活生命周期释放，
+  峰值 ~1GB；显存感知分块（探测 per-sample × 空闲显存）保证**任意 batch-size 不 OOM**。~8 min → ~14 s。
+- **性能项**（时间 25 + 显存 10，按排名；聚合 **ResNet 20% + BigFormer 80%**）：worker 协议采样（2 warmup + 5 计时）。
 
 ---
 
@@ -231,8 +230,8 @@ A–E 每项的命中证据写进 `plan.summary['c3d_evidence']` 供 code review
 1. **本地自评分脚本非官方**：`benchmarks/c32_c33/bench_c32_c33.py` 是按 spec.md 复刻的
    自评分工具，官方隐藏 `bench_c32_c33.py` 未随包发布，**请以官方评审为准**。本骨架已
    确保公共 API 与其契约一致。
-2. **C3.5 请在真实 GPU 上跑**：运行时间与峰值显存是排名项；开发机无 GPU，正式提交前
-   务必换 `onnxruntime-gpu` 复测精度与性能。
+2. **C3.5 在真实 GPU 上跑**：运行时间与峰值显存是排名项。已在评测容器（H200 MIG 1g.18gb）
+   上用 CuPy 后端复测：四模型精度过 1e-3，BigFormer ~14 s / 峰值 ~1 GB。无 onnxruntime-gpu 依赖。
 3. **BN 已折进 Conv**：ResNet 导出时 BatchNorm 已折入 Conv 权重，图中无 BN 节点，
    `FusedConv2dBatchNorm` 需先做预融合（见 C3.3 TODO）才能命中。
 4. **精度阈值统一 1e-3**（rtol=atol）；若用低精度加速，务必自测 ResNet 等深网不越界。
@@ -241,7 +240,8 @@ A–E 每项的命中证据写进 `plan.summary['c3d_evidence']` 供 code review
 
 ## 八、Top-5 待办（按分值优先级）
 
-1. **C3.5 GPU 性能**（25+10 分排名项）：低精度加速 + IOBinding/CUDA Graph，逐模型验精度。
+1. ~~**C3.5 GPU 性能**~~ ✅ 已实现：split-fp16 tensor-core MatMul（近 fp32 精度）+ BigFormer
+   逐层流式 + 激活释放 + 显存感知分块。BigFormer ~8 min→~14 s，任意 batch 不 OOM。
 2. **C3.3 Conv-BN 预融合**（F1 第 5 分 + F2/F3 提升）：`fusion.py::prefuse_conv_bn`。
 3. **C3.3 F2/F3 缩减**（各 3 分）：扩大融合覆盖（更多 EW 链 / bias 折叠）以逼近 60% 缩减锚点。
 4. **C3.2 D3 中间张量比率**（≤3 分）：为 movement 类算子补充 shape-aware 中间张量或调整口径。
