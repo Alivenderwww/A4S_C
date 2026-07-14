@@ -339,6 +339,41 @@ class Sim:
             if op == "CVTFI":                        # float -> int (trunc+clamp)
                 v = np.trunc(read_float(s1, st)).astype(np.int64)
                 wr_u32(d, (v & 0xffffffff).astype(np.uint32)); return
+        if op == "CVTII":
+            st = ins.src_type
+            d, s1 = ins.rd(), ins.rs1()
+            # Destination is a 64-bit register pair {R[r+1], R[r]}.
+            if ty == "b64":
+                if st in ("u32", "b32"):
+                    lo, hi = a_u32(s1), np.zeros(W, np.uint32)
+                elif st == "s32":
+                    lo = a_u32(s1)
+                    hi = np.where(a_s32(s1) < np.int32(0),
+                                  np.uint32(0xFFFFFFFF), np.uint32(0))
+                elif st == "b64":
+                    lo, hi = a_u32(s1), a_u32((s1 + 1) & 0xff)
+                else:
+                    if self.strict:
+                        raise ExecError("CVTII.b64: unsupported source type '%s'" % st)
+                    lo, hi = a_u32(s1), np.zeros(W, np.uint32)
+                wr_u32(d, lo)
+                R[:, (d + 1) & 0xff] = np.where(em, hi, R[:, (d + 1) & 0xff])
+                return
+            # Destination is a 32-bit (or smaller) single register.
+            if ty in ("u32", "s32", "b32", "u8", "s8"):
+                if st in ("b64",):
+                    wr_u32(d, a_u32(s1))            # truncate to low word
+                elif st in ("u32", "s32", "b32", "u8", "s8"):
+                    wr_u32(d, a_u32(s1))            # 32-bit identity copy
+                else:
+                    if self.strict:
+                        raise ExecError("CVTII.%s: unsupported source type '%s'" % (ty, st))
+                    wr_u32(d, a_u32(s1))
+                return
+            if self.strict:
+                raise ExecError("CVTII: unsupported destination type '%s' (strict mode)" % ty)
+            wr_u32(d, a_u32(s1))
+            return
         if op == "LD":
             if ty not in ("b32", "b64", "u32", "s32", "f32"):
                 raise ExecError("illegal LD type '.%s' (C1 spec §5.3)" % ty)

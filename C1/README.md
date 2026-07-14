@@ -66,10 +66,13 @@ C1/
 
 ```bash
 cd C1
-make            # 生成 bin/aec-cc 与 bin/aec-objdump
-make selftest   # 构建并运行编码器 golden 自检
-make test       # 构建并跑 tests/run_public.sh
-make clean      # 清理 obj/ bin/
+make               # 生成 bin/aec-cc 与 bin/aec-objdump
+make selftest      # 构建并运行编码器 golden 自检
+make test          # 聚合：test-public + test-extreme（public 门禁 + 本地 fast contract 套件）
+make test-public   # 构建并跑 tests/run_public.sh（编译/反汇编/校验全部 5 个公开用例）
+make test-extreme  # 本地 fast contract 套件（自建模拟器，非官方 CModel）
+make test-frontier # 本地 fast frontier  套件（自建模拟器，非官方 CModel）
+make clean         # 清理 obj/ bin/
 ```
 
 ### 关于编译器标准（重要）
@@ -85,7 +88,65 @@ make clean      # 清理 obj/ bin/
   exec，因此无论评测机是否预先构建，`compiler/aec-cc kernel.ptx -O2 -o out --report r.json`
   都能直接工作。本机（MinGW）另在 `compiler/aec-cc.exe` 放一份 native 供本地测试。
 - **提交前建议**：在一台带 GCC 的 Linux 机器上跑一次 `make build submit`，确认评测环境能
-  从源码构建出 `compiler/aec-cc`（本开发机 g++ 4.9.2 只能验证 c++11 编译，未在 GCC 13/ARM 上实测）。
+   从源码构建出 `compiler/aec-cc`（本开发机 g++ 4.9.2 只能验证 c++11 编译，未在 GCC 13/ARM 上实测）。
+
+### 测试目标详解
+
+```bash
+# make test 聚合了以下两条：
+make test-public   # ① 公开门禁：编译/反汇编/校验全部 5 个公开用例
+make test-extreme  # ② 本地 fast contract 套件（自建模拟器，非官方 CModel）
+
+# 单独跑 frontier 套件（不在 make test 内，按需使用）：
+make test-frontier
+```
+
+每个 `test-*` 目标的等价直接命令（C1 为工作目录，模块导入基于包路径）：
+
+```bash
+# 等价于 make test-public（bash 脚本包装的编译+反汇编+校验）
+bash tests/run_public.sh
+
+# 等价于 make test-extreme
+python3 -m tests.extreme.run_extreme --suite contract --backend local --profile fast --opt all
+
+# 等价于 make test-frontier
+python3 -m tests.extreme.run_extreme --suite frontier --backend local --profile fast --opt O2
+```
+
+> **`--opt` 是必需的**：`run_extreme` 要求显式选择 `O0`、`O2`、`O3` 或 `all`；
+> 不传 `--opt` 会报错，`make test-*` 已包含该参数。
+
+> **Windows 注意**：若系统没有 `python3` 这个命令（常见于原生 Windows Python 安装），
+> 请显式替换为 `py -3.13`（或你的实际 Python 版本），不要依赖隐式解释器回退：
+> `py -3.13 -m tests.extreme.run_extreme --suite contract --backend local --profile fast --opt all`。
+
+### 官方 CModel 验证（Linux 服务器）
+
+本地 `--backend local` 使用自建 AEC 功能模拟器（`sim/aec_sim.py`）作 oracle，
+**PASS 不代表官方 CModel 认可**。正式验证须在 Linux x86-64 服务器上通过官方 golden model
+运行，由仓库根目录的 `scripts/remote_exec.py` 提交：
+
+```bash
+# 从 repo 根目录运行；将 <isolated-checkout> 替换为服务器上的隔离快照路径。
+python scripts/remote_exec.py "cd <isolated-checkout>/C1 && python3 -m tests.extreme.run_extreme \
+  --suite contract --backend cmodel --profile strict --opt all"
+
+python scripts/remote_exec.py "cd <isolated-checkout>/C1 && python3 -m tests.extreme.run_extreme \
+  --suite frontier --backend cmodel --profile strict --opt O2"
+```
+
+上述命令在 Linux 服务器上以 `--backend cmodel --profile strict` 运行，对比官方 AEC
+golden model 输出。**不需要本地 WSL 环境**。
+
+### 测试语义说明
+
+| 结果 | 含义 |
+|------|------|
+| **PASS** | 当前所选 backend 的执行与 oracle 完整匹配；只有 `--backend cmodel` 的 PASS 才是官方 CModel 证据。 |
+| **XFAIL** | **预期失败**——代码已执行、输出已比对、结果已注册到用例清单的**已知编译器缺陷**。XFAIL 不是跳过，也不是未执行；它是有跟踪记录的、可复现的被接受偏离。 |
+| **FAIL** | 实现与 oracle 不一致，退出码非零，需调查。 |
+| **XPASS** | 标记为 XFAIL 的用例意外 PASS——同样退出码非零，需调查（可能是缺陷已被修复但未更新清单）。 |
 
 ---
 

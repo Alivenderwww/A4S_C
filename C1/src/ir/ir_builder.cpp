@@ -113,6 +113,7 @@ uint32_t specialSelector(const std::string &name) {
 struct Builder {
   ir::Function *fn;
   std::map<std::string, uint32_t> vreg;   // "%rd1" -> vreg id.
+  std::map<std::string, uint32_t> pred;   // "%p1" -> predicate id (0..7).
   std::map<std::string, unsigned> paramOff;
   bool pendingSplit;                      // start a fresh block on next inst.
 
@@ -128,13 +129,15 @@ struct Builder {
     return id;
   }
 
-  // "%p1" / "%p3" -> predicate id 1..7 (clamped to 0..7).
-  static uint32_t predId(const std::string &name) {
-    const char *p = name.c_str();
-    while (*p && (*p < '0' || *p > '9')) ++p;
-    uint32_t v = 0;
-    while (*p >= '0' && *p <= '9') { v = v * 10 + (uint32_t)(*p - '0'); ++p; }
-    return v & 0x7u;
+  // "%p1" / "%p3" -> predicate id 0..7.
+  // Maintains a per-function name→ID map so that the same PTX predicate
+  // always maps to the same ID (no &7 clamp — that would alias %p5↔%p13).
+  uint32_t predId(const std::string &name) {
+    std::map<std::string, uint32_t>::iterator it = pred.find(name);
+    if (it != pred.end()) return it->second;
+    uint32_t id = fn->regs.nextPred++;
+    pred[name] = id;
+    return id;
   }
 
   void ensureBlock() {

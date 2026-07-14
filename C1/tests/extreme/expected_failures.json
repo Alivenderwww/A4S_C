@@ -1,0 +1,71 @@
+{
+  "gpr-live-255": {
+    "issue": "C1-SPILL-001",
+    "phase_by_backend": {
+      "local": "execute",
+      "cmodel": "compare"
+    },
+    "reason": "exhausted GPR/pair allocation miscompares"
+  },
+  "gpr-live-256": {
+    "issue": "C1-SPILL-001",
+    "phase_by_backend": {
+      "local": "execute",
+      "cmodel": "compare"
+    },
+    "reason": "exhausted GPR/pair allocation miscompares"
+  },
+  "gpr-live-300": {
+    "issue": "C1-SPILL-001",
+    "phase_by_backend": {
+      "local": "compare",
+      "cmodel": "compare"
+    },
+    "reason": "exhausted GPR/pair allocation miscompares"
+  },
+  "pair-live-127": {
+    "issue": "C1-PAIR-001",
+    "phase_by_backend": {
+      "local": "execute",
+      "cmodel": "compare"
+    },
+    "reason": "pair pressure exceeds register-pair allocation capacity"
+  },
+  "pair-live-128": {
+    "issue": "C1-PAIR-001",
+    "phase_by_backend": {
+      "local": "execute",
+      "cmodel": "compare"
+    },
+    "reason": "pair pressure exceeds register-pair allocation capacity"
+  },
+  "pair-live-140": {
+    "issue": "C1-PAIR-001",
+    "phase_by_backend": {
+      "local": "execute",
+      "cmodel": "execute"
+    },
+    "reason": "pair140 CModel OOB execution"
+  },
+  "pred-live-9": {
+    "issue": "C1-PRED-001",
+    "phase_by_backend": {
+      "cmodel": "execute"
+    },
+    "reason": ">8 virtual predicates reach unencodable high bits because predicate allocation/spilling is not implemented"
+  },
+  "pred-live-12": {
+    "issue": "C1-PRED-001",
+    "phase_by_backend": {
+      "cmodel": "execute"
+    },
+    "reason": ">8 virtual predicates reach unencodable high bits because predicate allocation/spilling is not implemented"
+  },
+  "pred-live-16": {
+    "issue": "C1-PRED-001",
+    "phase_by_backend": {
+      "cmodel": "execute"
+    },
+    "reason": ">8 virtual predicates reach unencodable high bits because predicate allocation/spilling is not implemented"
+  }
+}

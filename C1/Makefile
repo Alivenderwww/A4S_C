@@ -29,7 +29,7 @@ OD_OBJ := obj/tools/aec-objdump.o
 CC_BIN := bin/aec-cc$(EXE)
 OD_BIN := bin/aec-objdump$(EXE)
 
-.PHONY: all build submit test conformance clean selftest
+.PHONY: all build submit test test-public test-extreme test-frontier conformance clean selftest
 all: build submit
 
 build: $(CC_BIN) $(OD_BIN)
@@ -69,9 +69,20 @@ obj/tools/%.o: tools/%.cpp
 selftest: $(CC_BIN)
 	./$(CC_BIN) --selftest && echo "selftest OK"
 
-# Compile + disassemble every public PTX test.
-test: build
+# Aggregate: public gate + local fast contract suite.
+test: test-public test-extreme
+
+# Compile + disassemble every public PTX test (public gate).
+test-public: build
 	bash tests/run_public.sh
+
+# Local fast contract suite (self-built simulator, not official CModel).
+test-extreme: build
+	python3 -m tests.extreme.run_extreme --suite contract --backend local --profile fast --opt all
+
+# Local fast frontier suite (self-built simulator, not official CModel).
+test-frontier: build
+	python3 -m tests.extreme.run_extreme --suite frontier --backend local --profile fast --opt O2
 
 # CModel conformance regression: divergence (partial-block bounds guards,
 # `cond ? a : b` if-conversion) + ISA coverage (%laneid, SHL.u32, shr, bitwise,
