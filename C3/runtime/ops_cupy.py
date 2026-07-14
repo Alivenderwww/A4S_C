@@ -154,16 +154,23 @@ def op_Softmax(x, axis=-1, **_):
     return e / cp.sum(e, axis=axis, keepdims=True)
 
 
+# Fused LayerNorm affine: y = (x-mean) * inv_std * scale + bias in one kernel
+# (broadcasts inv[.,.,1] and scale/bias[d]) instead of separate div/mul/mul/add.
+_ln_affine = cp.ElementwiseKernel(
+    "float32 xm, float32 inv, float32 scale, float32 bias", "float32 y",
+    "y = xm * inv * scale + bias;", "ln_affine")
+
+
 def op_LayerNormalization(x, scale, bias=None, axis=-1, epsilon=1e-5, **_):
     axis = axis if axis >= 0 else x.ndim + axis
     axes = tuple(range(axis, x.ndim))
     mean = cp.mean(x, axis=axes, keepdims=True)
-    var = cp.mean((x - mean) ** 2, axis=axes, keepdims=True)
-    norm = (x - mean) / cp.sqrt(var + epsilon)
-    y = norm * scale
+    xm = x - mean                                    # once (was recomputed for norm)
+    var = cp.mean(xm * xm, axis=axes, keepdims=True)
+    inv = 1.0 / cp.sqrt(var + epsilon)
     if bias is not None:
-        y = y + bias
-    return y
+        return _ln_affine(xm, inv, scale, bias)      # one fused kernel
+    return xm * inv * scale
 
 
 def op_Gather(data, indices, axis=0, **_):
