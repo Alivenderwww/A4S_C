@@ -32,7 +32,9 @@ def main(argv=None) -> int:
     ap.add_argument("--output", required=True, help="output DAG JSON path")
     args = ap.parse_args(argv)
 
-    graph = import_onnx_graph(args.onnx)
+    # C3.1 exports graph structure only -- skip the external-data weight blob so
+    # BigFormer's 19 GB .onnx.data is never read (instant, no timeout risk).
+    graph = import_onnx_graph(args.onnx, load_weights=False)
     dag = graph.to_dag_dict()
 
     out_dir = os.path.dirname(os.path.abspath(args.output))

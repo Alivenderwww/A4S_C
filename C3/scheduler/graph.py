@@ -286,7 +286,7 @@ def _value_info_shape(vi) -> List[Any]:
     return shape
 
 
-def import_onnx_graph(source: Any) -> Graph:
+def import_onnx_graph(source: Any, load_weights: bool = True) -> Graph:
     """Load an ONNX model (path / ``ModelProto`` / ``Graph``) into a :class:`Graph`.
 
     This is the public API the C3.2 / C3.3 grader relies on::
@@ -295,6 +295,11 @@ def import_onnx_graph(source: Any) -> Graph:
 
     Passing an existing :class:`Graph` is idempotent (returns it unchanged) so
     callers can be liberal about what they hand in.
+
+    ``load_weights=False`` parses only the graph *structure* -- nodes, edges,
+    initializer names, I/O -- and skips the external-data weight blob. C3.1 (DAG
+    export) needs no weight values, so this keeps it instant on BigFormer instead
+    of reading its 19 GB ``.onnx.data``. C3.5 keeps the default (weights loaded).
     """
     if isinstance(source, Graph):
         return source
@@ -303,7 +308,7 @@ def import_onnx_graph(source: Any) -> Graph:
     from onnx import numpy_helper
 
     if isinstance(source, (str, bytes)):
-        model = onnx.load(source)
+        model = onnx.load(source, load_external_data=load_weights)
     elif hasattr(source, "graph"):  # ModelProto
         model = source
     else:
@@ -311,9 +316,13 @@ def import_onnx_graph(source: Any) -> Graph:
 
     og = model.graph
 
-    # initializer values (weights / folded constants)
+    # initializer values (weights / folded constants); names only when structure-
+    # only, so downstream input/edge derivation still excludes initializers.
     initializers: Dict[str, "np.ndarray"] = {}
     for init in og.initializer:
+        if not load_weights:
+            initializers[init.name] = None  # type: ignore
+            continue
         try:
             initializers[init.name] = numpy_helper.to_array(init)
         except Exception:
